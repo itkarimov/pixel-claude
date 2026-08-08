@@ -24,6 +24,46 @@ KIND_COLOR = {"user": CYAN, "assistant": INK, "tool": GREEN,
 KIND_MARK = {"user": "›", "assistant": "◆", "tool": "·",
              "system": "—", "error": "!"}
 
+EYE_W = 44               # ширина предпросмотра камеры в арт-пикселях
+EYE_SCALE_MAX = 2        # крупнее делать незачем: он не должен спорить с лицом
+
+
+class MicButton(QPushButton):
+    """
+    Кнопка микрофона с уровнем звука внутри.
+
+    Полоска громкости раньше висела поверх портрета сверху и перечёркивала
+    лицо. Место ей внутри самой кнопки: смотришь на «МИК ВКЛ» — там же и
+    видишь, что тебя слышно.
+    """
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._level = 0.0
+        self._accent = QColor(GREEN)
+
+    def set_level(self, level):
+        level = max(0.0, min(1.0, float(level)))
+        # перерисовываем только на заметное изменение: кадры идут 33 раза в
+        # секунду, и дёргать окно на каждый мелкий скачок незачем
+        if abs(level - self._level) > 0.02:
+            self._level = level
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked():
+            return
+        p = QPainter(self)
+        inner = self.rect().adjusted(5, 0, -5, -5)
+        bar = 5
+        y = inner.bottom() - bar
+        p.fillRect(inner.left(), y, inner.width(), bar, QColor(EDGE_DARK))
+        width = int(inner.width() * self._level)
+        if width:
+            p.fillRect(inner.left(), y, width, bar, self._accent)
+        p.end()
+
 
 class Portrait(QWidget):
     """Портрет: спрайт эмоции, индикатор речи, кнопки микрофона и камеры."""
@@ -43,7 +83,7 @@ class Portrait(QWidget):
         self._eye = None                  # кадр с камеры для предпросмотра
         self.canvas = QColor(BG)          # цвет фона берём из самого спрайта
 
-        self.mic = QPushButton("МИК ВЫКЛ", self)
+        self.mic = MicButton("МИК ВЫКЛ", self)
         self.mic.setCheckable(True)
         self.mic.setCursor(Qt.PointingHandCursor)
         self.mic.setFixedSize(132, 40)
@@ -89,6 +129,7 @@ class Portrait(QWidget):
 
     def set_level(self, level):
         self.level = level
+        self.mic.set_level(level)
 
     # ── анимация ──────────────────────────────────────────────────────────
     def _breathe(self):
@@ -135,7 +176,7 @@ class Portrait(QWidget):
         pix = QPixmap()
         if not pix.loadFromData(jpeg, "JPG") or pix.isNull():
             return
-        self._eye = pix.scaledToWidth(56, Qt.SmoothTransformation)
+        self._eye = pix.scaledToWidth(EYE_W, Qt.SmoothTransformation)
         self.update()
 
     def camera_failed(self):
@@ -188,15 +229,18 @@ class Portrait(QWidget):
                 hh = 4 + ((self._phase + i) % 4) * 4
                 p.fillRect(bx + i * (bw + 3), by - hh, bw, hh, accent)
 
-        if self.mic.isChecked():               # индикатор громкости
-            mw = int((w - 20) * min(1.0, self.level))
-            p.fillRect(x + 10, y + 10, w - 20, 5, track)
-            p.fillRect(x + 10, y + 10, mw, 5, accent)
+        # Уровень громкости рисует сама кнопка микрофона: поверх портрета он
+        # перечёркивал лицо. Цвет ей подбирать не надо — фон кнопки всегда
+        # тёмный, а этот accent подстроен под светлый фон спрайта и в кнопке
+        # сливается со всем подряд.
 
         if self._eye is not None:              # то, что она сейчас видит
-            k = max(1, min(3, scale))          # крупные пиксели — так в стиле
+            k = max(1, min(EYE_SCALE_MAX, scale))   # крупные пиксели — так в стиле
             ew, eh = self._eye.width() * k, self._eye.height() * k
-            ex, ey = x + w - ew - 10, y + 10
+            # левый нижний угол, вровень с кнопками: лицо должно оставаться
+            # открытым, а глазок — рядом с кнопкой, которая его включает
+            ex = x + 10
+            ey = min(self.mic.y() + self.mic.height() - eh, y + h - eh - 10)
             p.fillRect(ex - 3, ey - 3, ew + 6, eh + 6, QColor(PANEL))
             p.drawPixmap(ex, ey, ew, eh, self._eye)
             p.setPen(accent)
