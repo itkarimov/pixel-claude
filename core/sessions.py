@@ -24,6 +24,9 @@ EMOTION_RE = re.compile(r"^\s*\[\w+\]\s*")
 HEAD_LINES = 400          # сколько строк с начала читать ради cwd и первой реплики
 TAIL_WINDOWS = (262_144, 2_097_152, 16_777_216)   # окна поиска custom-title с конца
 
+SCAN_CAP = 800            # потолок обхода: дальше в прошлое список всё равно не листают
+SKIP_DIRS = ("claude-mem-observer-sessions",)     # фоновые агенты памяти, не наши сессии
+
 
 def projects_root():
     return os.path.join(os.path.expanduser("~"), ".claude", "projects")
@@ -113,14 +116,17 @@ def _scan_tail(path):
     return title, cwd
 
 
-def list_sessions(limit=40, workdir=None, unnamed=False):
+def list_sessions(limit=40, workdir=None, unnamed=False, unnamed_limit=60):
     """
-    Тот же список, что в сайдбаре приложения: сессии с заголовком, свежие сверху.
-    Безымянные (прогоны CLI, фоновые агенты) в приложении не показываются — здесь
-    тоже, если явно не попросить через unnamed=True.
+    Сессии, свежие сверху. Именованные — те же, что в сайдбаре приложения.
+    Безымянные (прогоны CLI, голосовые сессии оболочки) приложение прячет, здесь
+    их подмешивает unnamed=True, взяв в заголовок первую реплику.
+
+    Лимиты раздельные намеренно: безымянных на диске втрое больше, и на общем
+    счётчике они выдавливали бы рабочие сессии из списка.
 
     Сначала сортируем по времени файла (дёшево, только stat), читаем верхушку и
-    останавливаемся, набрав limit — иначе на сотнях сессий запуск бы тормозил.
+    останавливаемся, набрав оба лимита — иначе на сотнях сессий запуск бы тормозил.
     """
     pattern = os.path.join(project_dir(workdir) if workdir else projects_root(),
                            "*.jsonl" if workdir else os.path.join("*", "*.jsonl"))
@@ -130,18 +136,28 @@ def list_sessions(limit=40, workdir=None, unnamed=False):
         return []
 
     out = []
-    for path in paths[:400]:
-        if len(out) >= limit:
+    n_named = n_unnamed = 0
+    for path in paths[:SCAN_CAP]:
+        if n_named >= limit and (not unnamed or n_unnamed >= unnamed_limit):
             break
+        if any(d in path for d in SKIP_DIRS):
+            continue
         title, cwd = _scan_tail(path)
         first = ""
-        if not title:
-            if not unnamed:
+        if title:
+            if n_named >= limit:
+                continue
+        else:
+            if not unnamed or n_unnamed >= unnamed_limit:
                 continue
             first, head_cwd = _scan_head(path)
             cwd = cwd or head_cwd
             if not first:
                 continue
+        if title:
+            n_named += 1
+        else:
+            n_unnamed += 1
         name = title or first[:60]
         folder = os.path.basename(cwd.rstrip("\\/")) if cwd else ""
         out.append({

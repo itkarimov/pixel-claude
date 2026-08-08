@@ -276,8 +276,11 @@ class Shell(QObject):
             chat.append("system", "включи микрофон и говори")
 
         chat.set_status("собираю список сессий…")
+        # Показываем всё, включая безымянные прогоны CLI: приложение их прячет,
+        # а здесь они нужны — иначе голосовые сессии оболочки не найти.
         threading.Thread(target=lambda: self.list_loaded.emit(
-            sessions.list_sessions()), daemon=True).start()
+            sessions.list_sessions(limit=60, unnamed=True, unnamed_limit=60)),
+            daemon=True).start()
 
     def _note_prompt(self, kind, text):
         if kind == "user":
