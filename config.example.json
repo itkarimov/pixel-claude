@@ -1,5 +1,7 @@
 {
-  "workdir": "C:/UniTap/unitap_wibe_code",
+  "_комментарий": "Образец настроек. При первом запуске копируется в config.json, который в гит не попадает — правьте его, а не этот файл.",
+
+  "workdir": ".",
   "model": "",
   "permission_mode": "acceptEdits",
   "disable_mcp": true,

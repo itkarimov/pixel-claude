@@ -13,3 +13,6 @@ __pycache__/
 
 # забракованный арт первой версии, пересобирается tools/gen_character.py
 assets/sprites_generated/
+
+# локальные настройки: рабочая папка и прочее, репозиторий публичный
+config.json

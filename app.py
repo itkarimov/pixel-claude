@@ -7,6 +7,7 @@ Pixel Claude — голосовая пиксельная оболочка над
 """
 import json
 import os
+import shutil
 import sys
 import threading
 
@@ -58,9 +59,18 @@ def install_crash_log():
 
 
 def load_config():
+    """
+    Свой config.json в гит не попадает: в нём рабочая папка и прочее локальное,
+    а репозиторий публичный. При первом запуске создаётся из config.example.json.
+    """
     path = os.path.join(ROOT, "config.json")
+    if not os.path.exists(path):
+        shutil.copyfile(os.path.join(ROOT, "config.example.json"), path)
     with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
+        cfg = json.load(fh)
+    if not cfg.get("workdir") or not os.path.isdir(cfg["workdir"]):
+        cfg["workdir"] = ROOT              # чужой путь из примера не должен ронять
+    return cfg
 
 
 def load_state():

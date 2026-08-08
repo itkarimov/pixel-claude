@@ -33,7 +33,7 @@ def project_dir(workdir):
     """
     claude кодирует путь проекта, заменяя дефисом любой не-буквенно-цифровой
     символ — не только разделители, но и точки с подчёркиваниями:
-    C:\\UniTap\\unitap_wibe_code  →  C--UniTap-unitap-wibe-code
+    C:\\Projects\\my_app  →  C--Projects-my-app
     """
     key = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(workdir))
     return os.path.join(projects_root(), key)

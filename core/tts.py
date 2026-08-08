@@ -80,6 +80,10 @@ class Speaker(QObject):
 
     def _synth_edge(self, text):
         """edge-tts → mp3 → wav. None, если не получилось."""
+        if not self.cfg.get("voice"):
+            # пустой голос = «наружу ничего не отправлять»: edge-tts шлёт текст
+            # ответа на серверы Microsoft, а системный голос работает офлайн
+            return None
         try:
             import edge_tts
         except ImportError:
