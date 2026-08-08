@@ -26,9 +26,10 @@ KIND_MARK = {"user": "›", "assistant": "◆", "tool": "·",
 
 
 class Portrait(QWidget):
-    """Портрет: спрайт эмоции, моргание, индикатор речи и кнопка микрофона."""
+    """Портрет: спрайт эмоции, индикатор речи, кнопки микрофона и камеры."""
 
     mic_toggled = Signal(bool)
+    cam_toggled = Signal(bool)
 
     def __init__(self, sprites_dir, parent=None):
         super().__init__(parent)
@@ -39,6 +40,7 @@ class Portrait(QWidget):
         self.level = 0.0
         self._phase = 0
         self._breath = 0
+        self._eye = None                  # кадр с камеры для предпросмотра
         self.canvas = QColor(BG)          # цвет фона берём из самого спрайта
 
         self.mic = QPushButton("МИК ВЫКЛ", self)
@@ -47,6 +49,13 @@ class Portrait(QWidget):
         self.mic.setFixedSize(132, 40)
         self.mic.toggled.connect(self._on_mic)
         self._style_mic(False)
+
+        self.cam = QPushButton("ГЛАЗА ВЫКЛ", self)
+        self.cam.setCheckable(True)
+        self.cam.setCursor(Qt.PointingHandCursor)
+        self.cam.setFixedSize(132, 40)
+        self.cam.toggled.connect(self._on_cam)
+        self._style_btn(self.cam, False)
 
         # дыхание: спрайт качается на один арт-пиксель, чтобы портрет жил
         self._breath_timer = QTimer(self)
@@ -92,10 +101,11 @@ class Portrait(QWidget):
             self._phase = (self._phase + 1) % 4
             self.update()
 
-    # ── микрофон ──────────────────────────────────────────────────────────
-    def _style_mic(self, on):
+    # ── микрофон и камера ─────────────────────────────────────────────────
+    @staticmethod
+    def _style_btn(button, on):
         color, border = (GREEN, "#2f7d55") if on else (RED, "#7d2f2f")
-        self.mic.setStyleSheet(f"""
+        button.setStyleSheet(f"""
             QPushButton {{
                 background: {PANEL}; color: {color};
                 border: 3px solid {border};
@@ -105,14 +115,43 @@ class Portrait(QWidget):
             QPushButton:hover {{ background: #292244; }}
         """)
 
+    def _style_mic(self, on):
+        self._style_btn(self.mic, on)
+
     def _on_mic(self, on):
         self.mic.setText("МИК ВКЛ" if on else "МИК ВЫКЛ")
-        self._style_mic(on)
+        self._style_btn(self.mic, on)
         self.mic_toggled.emit(on)
 
+    def _on_cam(self, on):
+        self.cam.setText("ГЛАЗА ВКЛ" if on else "ГЛАЗА ВЫКЛ")
+        self._style_btn(self.cam, on)
+        if not on:
+            self._eye = None
+        self.cam_toggled.emit(on)
+
+    def set_camera_frame(self, jpeg):
+        """Кадр для предпросмотра. Мельчим — иначе видео выбивается из стиля."""
+        pix = QPixmap()
+        if not pix.loadFromData(jpeg, "JPG") or pix.isNull():
+            return
+        self._eye = pix.scaledToWidth(56, Qt.SmoothTransformation)
+        self.update()
+
+    def camera_failed(self):
+        """Камера не открылась — кнопку отжимаем, чтобы не врала."""
+        self.cam.blockSignals(True)
+        self.cam.setChecked(False)
+        self.cam.setText("ГЛАЗА ВЫКЛ")
+        self._style_btn(self.cam, False)
+        self.cam.blockSignals(False)
+        self._eye = None
+        self.update()
+
     def resizeEvent(self, event):
-        self.mic.move(self.width() - self.mic.width() - 14,
-                      self.height() - self.mic.height() - 14)
+        y = self.height() - self.mic.height() - 14
+        self.mic.move(self.width() - self.mic.width() - 14, y)
+        self.cam.move(self.width() - self.mic.width() - self.cam.width() - 22, y)
         super().resizeEvent(event)
 
     # ── отрисовка ─────────────────────────────────────────────────────────
@@ -153,7 +192,63 @@ class Portrait(QWidget):
             mw = int((w - 20) * min(1.0, self.level))
             p.fillRect(x + 10, y + 10, w - 20, 5, track)
             p.fillRect(x + 10, y + 10, mw, 5, accent)
+
+        if self._eye is not None:              # то, что она сейчас видит
+            k = max(1, min(3, scale))          # крупные пиксели — так в стиле
+            ew, eh = self._eye.width() * k, self._eye.height() * k
+            ex, ey = x + w - ew - 10, y + 10
+            p.fillRect(ex - 3, ey - 3, ew + 6, eh + 6, QColor(PANEL))
+            p.drawPixmap(ex, ey, ew, eh, self._eye)
+            p.setPen(accent)
+            p.drawRect(ex - 3, ey - 3, ew + 5, eh + 5)
         p.end()
+
+
+class ConfirmBar(QWidget):
+    """
+    Полоса «выполнять?»: показывает придержанную просьбу и две кнопки.
+
+    Голосом ответить можно и без неё, но кнопки нужны: если распознавание уже
+    один раз ошиблось, повторять «нет» в микрофон — так себе способ отменить.
+    """
+
+    confirmed = Signal()
+    rejected = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.text = QLabel("")
+        self.text.setWordWrap(True)
+        self.text.setStyleSheet(
+            f"color:{AMBER}; font-family:Consolas; font-size:12px;")
+
+        self.yes = QPushButton("ДА")
+        self.no = QPushButton("НЕТ")
+        for button, color, border in ((self.yes, GREEN, "#2f7d55"),
+                                      (self.no, RED, "#7d2f2f")):
+            button.setFixedSize(52, 28)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(f"""
+                QPushButton {{
+                    background:{PANEL}; color:{color}; border:3px solid {border};
+                    font-family:Consolas; font-size:12px; font-weight:bold;
+                }}
+                QPushButton:hover {{ background:#292244; }}
+            """)
+        self.yes.clicked.connect(self.confirmed.emit)
+        self.no.clicked.connect(self.rejected.emit)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(6)
+        lay.addWidget(self.text, 1)
+        lay.addWidget(self.yes, 0)
+        lay.addWidget(self.no, 0)
+        self.setStyleSheet(f"background:{PANEL}; border:3px solid {AMBER};")
+
+    def ask(self, text):
+        self.text.setText(f"выполнять? {text}")
+        self.show()
 
 
 class Chat(QWidget):
@@ -213,6 +308,9 @@ class Chat(QWidget):
         self.status.setStyleSheet(
             f"color:{GREY}; font-family:Consolas; font-size:11px; padding:2px 6px;")
 
+        self.confirm = ConfirmBar()
+        self.confirm.hide()
+
         top = QHBoxLayout()
         top.setSpacing(6)
         top.addWidget(self.picker, 1)
@@ -224,6 +322,7 @@ class Chat(QWidget):
         lay.addLayout(top)
         lay.addWidget(self.view, 1)
         lay.addWidget(self.status, 0, Qt.AlignRight)
+        lay.addWidget(self.confirm, 0)
         lay.addWidget(self.input, 0)
 
     # ── список сессий ─────────────────────────────────────────────────────

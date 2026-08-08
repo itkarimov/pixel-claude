@@ -7,6 +7,7 @@ Pixel Claude — голосовая пиксельная оболочка над
 """
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -20,8 +21,11 @@ from PySide6.QtWidgets import (QApplication, QMenu,     # noqa: E402
 
 from core import sessions                               # noqa: E402
 from core.agent import AgentRunner                      # noqa: E402
+from core.confirm import Confirmer                      # noqa: E402
 from core.stt import Listener                           # noqa: E402
 from core.tts import Speaker                            # noqa: E402
+from core.vision import Eyes                            # noqa: E402
+from core.watcher import Describer                      # noqa: E402
 from ui.window import MainWindow                        # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +35,13 @@ CRASH = os.path.join(ROOT, "crash.log")
 # по собственной базе (IndexedDB) со своими id — сессию, созданную снаружи, оно
 # не увидит. Чтобы такие разговоры не пропадали хотя бы здесь, ведём их сами.
 MINE = os.path.join(ROOT, "mine.json")
+
+# Просьбы, на которые словесное описание не годится: если человек просит
+# посмотреть прямо сейчас, фраза двадцатисекундной давности — это враньё,
+# нужен настоящий свежий кадр.
+LOOK_NOW = re.compile(
+    r"(посмотр|смотр|погляд|глян|видишь|что вид|как я выгляж|что у меня|"
+    r"что я держ|узна[её]шь|на камер|в камер|кадр)", re.I)
 
 
 def install_crash_log():
@@ -135,7 +146,11 @@ class Shell(QObject):
         self.agent = AgentRunner(cfg)
         self.speaker = Speaker(cfg)
         self.listener = Listener(cfg)
+        self.eyes = Eyes(cfg)
+        self.watcher = Describer(cfg, self.eyes)
+        self.confirmer = Confirmer(cfg)
         self.busy = False
+        self.saved_frames = 0        # сколько кадров не отправили как повтор
         self.tray = None
         self.app_items = []          # список из приложения, без своих сессий
         self.last_prompt = ""        # им озаглавим сессию, если её заведут сейчас
@@ -143,9 +158,11 @@ class Shell(QObject):
         self._wire()
         self._greet()
         self._tray()
-        # поднимаем claude сразу: инициализация и хуки отработают, пока человек
-        # только тянется к микрофону, и первая реплика не ждёт лишних секунд
+        # поднимаем claude сразу: инициализация отработает, пока человек только
+        # тянется к микрофону, и первая реплика не ждёт лишних секунд
         self.agent.start()
+        # то же и для голоса: первое соединение с синтезом стоит лишние 1.7 с
+        self.speaker.warmup()
 
     # ── трей ──────────────────────────────────────────────────────────────
     def _tray(self):
@@ -160,19 +177,22 @@ class Shell(QObject):
         # с висячим указателем — и приложение падает молча.
         self.menu = menu = QMenu()
         act_show = QAction("Показать", menu)
-        act_show.triggered.connect(self.win.show_up)
+        act_show.triggered.connect(self._show_window)
         self.act_mic = QAction("Включить микрофон", menu, checkable=True)
         self.act_mic.triggered.connect(self.win.portrait.mic.setChecked)
+        self.act_cam = QAction("Включить камеру", menu, checkable=True)
+        self.act_cam.triggered.connect(self.win.portrait.cam.setChecked)
         act_quit = QAction("Выход", menu)
         act_quit.triggered.connect(self.quit)
         menu.addAction(act_show)
         menu.addAction(self.act_mic)
+        menu.addAction(self.act_cam)
         menu.addSeparator()
         menu.addAction(act_quit)
 
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
-            lambda r: self.win.show_up()
+            lambda r: self._show_window()
             if r == QSystemTrayIcon.Trigger else None)
         self.tray.show()
 
@@ -181,9 +201,15 @@ class Shell(QObject):
                 "Pixel Claude", "Свернулась в трей — сессия жива, микрофон работает",
                 QSystemTrayIcon.Information, 4000))
 
+    def _show_window(self):
+        self.eyes.set_idle(False)
+        self.win.show_up()
+
     def quit(self):
         self.win.allow_quit = True
         self.listener.stop()
+        self.watcher.stop()
+        self.eyes.stop()
         self.agent.stop()
         if self.tray:
             self.tray.hide()
@@ -193,6 +219,7 @@ class Shell(QObject):
     def _wire(self):
         w = self.win
         w.portrait.mic_toggled.connect(self.on_mic)
+        w.portrait.cam_toggled.connect(self.on_cam)
         w.chat.submitted.connect(self.on_input)
         w.chat.session_picked.connect(self.on_session_picked)
         w.chat.session_new.connect(self.on_session_new)
@@ -214,6 +241,21 @@ class Shell(QObject):
 
         self.speaker.speaking.connect(self.on_speaking)
         self.speaker.status.connect(w.chat.set_status)
+
+        self.eyes.frame.connect(w.portrait.set_camera_frame)
+        self.eyes.status.connect(w.chat.set_status)
+        self.eyes.active.connect(self.on_eyes)
+        self.eyes.skipped.connect(self.on_frame_skipped)
+        self.watcher.status.connect(w.chat.set_status)
+        self.watcher.described.connect(self.on_described)
+
+        self.confirmer.ask.connect(self.on_confirm_ask)
+        self.confirmer.accepted.connect(self.on_confirm_accepted)
+        self.confirmer.dropped.connect(self.on_confirm_dropped)
+        w.chat.confirm.confirmed.connect(self.confirmer.accept)
+        w.chat.confirm.rejected.connect(self.confirmer.reject)
+        # свёрнутое окно предпросмотр не показывает — незачем греть камеру
+        w.hidden_to_tray.connect(lambda: self.eyes.set_idle(True))
 
     def _greet(self):
         chat = self.win.chat
@@ -272,6 +314,8 @@ class Shell(QObject):
         if not item:
             return
         self.speaker.shutup()
+        self.eyes.forget()
+        self.watcher.forget()          # в чужом контексте кадра ещё не видели
         self.agent.set_session(item["id"], item["cwd"])
         self.win.chat.clear()
         folder = os.path.basename((item["cwd"] or "").rstrip("\\/"))
@@ -282,6 +326,8 @@ class Shell(QObject):
 
     def on_session_new(self):
         self.speaker.shutup()
+        self.eyes.forget()
+        self.watcher.forget()
         self.agent.reset()
         self.agent.workdir = self.cfg["workdir"]     # новая — в папке из конфига
         self.win.chat.clear()
@@ -312,16 +358,112 @@ class Shell(QObject):
             self.act_mic.setChecked(on)
             self.act_mic.setText("Выключить микрофон" if on else "Включить микрофон")
 
+    def on_cam(self, on):
+        if on:
+            self.eyes.set_idle(not self.win.isVisible())
+            self.eyes.start()
+            self.watcher.start()
+        else:
+            self.watcher.stop()
+            self.eyes.stop()
+            if self.saved_frames:
+                # видно, ради чего всё затевалось: кадр ~400 токенов
+                self.win.chat.append(
+                    "system", f"кадров не отправлено как повтор: {self.saved_frames} "
+                              f"(~{self.saved_frames * 400} токенов)")
+            self.saved_frames = 0
+        if self.tray:
+            self.act_cam.setChecked(on)
+            self.act_cam.setText("Выключить камеру" if on else "Включить камеру")
+
+    def on_eyes(self, active):
+        """Камера отвалилась сама — отжимаем кнопку, чтобы она не врала."""
+        if not active and self.win.portrait.cam.isChecked():
+            self.win.portrait.camera_failed()
+            self.watcher.stop()
+            if self.tray:
+                self.act_cam.setChecked(False)
+                self.act_cam.setText("Включить камеру")
+
+    def on_frame_skipped(self):
+        self.saved_frames += 1
+
+    def on_described(self, text):
+        """Показываем в ленте, что именно она видит — иначе камера как чёрный ящик."""
+        self.win.chat.append("system", f"вижу: {text}")
+
+    def _compose(self, text):
+        """
+        Собирает реплику вместе со зрением: свежий кадр, если сцена изменилась
+        или человек прямо просит посмотреть; иначе — словесное описание, оно
+        на порядок дешевле кадра.
+        """
+        if not self.eyes.is_on():
+            return text, None
+        shot = self.eyes.snapshot(force=bool(LOOK_NOW.search(text)))
+        if shot:
+            return text, shot
+        note = self.watcher.note()
+        return (f"{note}\n{text}" if note else text), None
+
+    # ── просьбы и подтверждение ───────────────────────────────────────────
+    def _run(self, text):
+        """Отдать просьбу агенту как есть."""
+        self.speaker.shutup()
+        body, shot = self._compose(text)
+        self.agent.send(body, shot, display=text)
+
+    def _offer(self, text, spoken):
+        """Опасную просьбу придерживаем и переспрашиваем, остальные — сразу."""
+        if self.confirmer.needs(text, spoken):
+            self.confirmer.hold(text)
+        else:
+            self._run(text)
+
+    def _answer(self, text):
+        """Пока висит «выполнять?», сказанное идёт сюда, а не агенту."""
+        if self.confirmer.reply(text) != "other":
+            return
+        # ни да, ни нет — значит человек услышал, что его не так поняли, и
+        # сказал иначе. Прежнюю просьбу снимаем молча и разбираем новую.
+        self.confirmer.clear()
+        self.win.chat.confirm.hide()
+        self._offer(text, spoken=True)
+
+    def on_confirm_ask(self, phrase):
+        self.win.chat.confirm.ask(self.confirmer.pending())
+        self.win.chat.append("system", phrase)
+        self.win.portrait.set_emotion("puzzled")
+        self.speaker.shutup()
+        self.speaker.say(phrase)
+
+    def on_confirm_accepted(self, text):
+        self.win.chat.confirm.hide()
+        self._run(text)
+
+    def on_confirm_dropped(self, text, quiet):
+        self.win.chat.confirm.hide()
+        self.win.portrait.set_emotion("relief")
+        if quiet:
+            self.win.chat.append("system", f"не дождалась ответа, отменила: {text}")
+        else:
+            self.win.chat.append("system", f"отменила: {text}")
+            self.speaker.say("Отменила.")
+
     def on_heard(self, text):
+        if self.confirmer.pending():
+            self._answer(text)
+            return
         if self.busy:
             self.win.chat.append("system", f"(пропустила: {text})")
             return
-        self.speaker.shutup()
-        self.agent.send(text)
+        self._offer(text, spoken=True)
 
     def on_input(self, text):
-        self.speaker.shutup()
-        self.agent.send(text)
+        if self.confirmer.pending():
+            self._answer(text)
+            return
+        self._offer(text, spoken=False)
 
     def on_busy(self, busy):
         self.busy = busy

@@ -3,14 +3,27 @@
 Мост к claude CLI: один долгоживущий процесс на всю сессию.
 
 Почему не процесс на реплику (как было сначала): замеры показали 15.6 с на ход,
-из которых 13 — накладные. Хуки 4.8 с, инициализация 3.2 с, завершение 2.1 с,
-и лишь 2.6 с собственно работы модели. Плюс загрузка MCP-серверов раздувала
-первый ход до 35 с.
+из которых 13 — накладные. Плюс загрузка MCP-серверов раздувала первый ход
+до 35 с. Отсюда долгоживущий процесс (`--input-format stream-json`) и
+отключённые MCP-серверы.
 
-Стало: процесс поднимается один раз (`--input-format stream-json`), хуки
-отрабатывают тоже один раз, MCP-серверы отключены, а озвучка идёт по приходу
-текста, не дожидаясь финального события — это ещё минус три секунды.
+Но и после этого ход занимал 5.9 с до первой фразы. Причина нашлась замером
+(tools/bench_modes.py): хук claude-mem `UserPromptSubmit` запускает node на
+КАЖДУЮ реплику и стоит 1.5–2.5 с, а вместе с `Stop` и `PostToolUse` — 3.7 с
+на ход. Долгоживущий процесс тут не спасает: хук на то и хук, что срабатывает
+каждый раз.
+
+    как было                      5.90 с до первой фразы, старт 9.24 с
+    --setting-sources project,local  2.19 с,                старт 2.46 с
+    --safe-mode                      2.15 с,                старт 2.33 с
+
+По умолчанию берём первый вариант: он снимает пользовательские настройки
+(там и лежат хуки), но оставляет CLAUDE.md и правила проекта — оболочке они
+нужны, она же работает в проекте. Флаг --bare, который выглядит ещё быстрее,
+не годится: он вообще не логинится и падает за 0.05 с с «Not logged in», что
+в замере легко принять за ускорение.
 """
+import base64
 import json
 import os
 import re
@@ -36,7 +49,18 @@ SYSTEM_APPEND = (
     "4) [done] — задача выполнена, [think] — размышляю или нужны уточнения, "
     "[unhappy] — не вышло, [angry] — сломалось всерьёз, [puzzled] — не поняла "
     "просьбу, [relief] — обошлось, [excited] — вышло здорово, [sly] — с хитрецой. "
-    "Пример правильного ответа: [done] Готово, поправила три файла в core."
+    "Пример правильного ответа: [done] Готово, поправила три файла в core. "
+    "ЕСЛИ К РЕПЛИКЕ ПРИЛОЖЕН КАДР С КАМЕРЫ: это то, что ты видишь прямо сейчас "
+    "своими глазами, а не присланный файл — так про него и говори. Не описывай "
+    "кадр без просьбы, просто учитывай, что видишь. "
+    "ЕСЛИ В РЕПЛИКЕ ЕСТЬ СТРОКА «[вижу] …»: это то же самое зрение, только "
+    "словами — что сейчас в камере. Кадра при этом нет, но видишь ты именно это. "
+    "Если строка помечена «(было N с назад)» — картинка могла устареть, и когда "
+    "человек спрашивает про сиюминутное, честнее сказать, что нужен свежий взгляд. "
+    "ЕСЛИ ЗАДАЧА ТРЕБУЕТ РАБОТЫ инструментами: СНАЧАЛА скажи одну короткую фразу "
+    "с тегом — «[think] Сейчас посмотрю» — и только потом берись за инструменты, "
+    "иначе человек сидит в тишине и думает, что оболочка зависла. В конце — "
+    "вторая фраза с результатом."
 )
 
 EMOTIONS = {"neutral", "smile", "happy", "laugh", "surprised", "puzzled",
@@ -46,6 +70,8 @@ EMOTIONS = {"neutral", "smile", "happy", "laugh", "surprised", "puzzled",
 REMINDER = ("\n\n[оболочка] Ответь одной-двумя фразами живой речью, без markdown, "
             "без обратных кавычек и списков — текст пойдёт в озвучку. "
             "О себе — в женском роде: посмотрела, сделала, готова. "
+            "Если собираешься работать инструментами — сперва короткая фраза "
+            "вслух, потом работа. "
             "Первым символом — тег эмоции, один из: "
             + " ".join(f"[{e}]" for e in sorted(EMOTIONS)))
 
@@ -105,7 +131,10 @@ class AgentRunner(QObject):
         self.claude = shutil.which("claude") or shutil.which("claude.cmd")
         self._proc = None
         self._lock = threading.Lock()
-        self._said = ""          # что уже озвучено в этом ходу
+        self._buf = ""           # текст сообщения, копится по кускам
+        self._said = ""          # что уже озвучено из текущего сообщения
+        self._last_msg = ""      # последнее озвученное сообщение целиком
+        self._emo = None         # какая эмоция уже показана в этом сообщении
         self._busy = False
         self._pending = None     # реплика, сказанная до конца хода
 
@@ -122,34 +151,55 @@ class AgentRunner(QObject):
             return
         threading.Thread(target=self._spawn, daemon=True).start()
 
-    def send(self, text):
+    def send(self, text, image=None, display=None):
+        """
+        image — кадр с камеры в JPEG, если зрение включено.
+        display — что показать в ленте вместо text: в реплику подмешивается
+        служебное («[вижу] …»), а человеку в ленте нужны только его слова.
+        """
         text = (text or "").strip()
         if not text:
             return
         if not self.claude:
             self.log.emit("error", "claude CLI не найден в PATH")
             return
-        self.log.emit("user", text)
+        self.log.emit("user", (display or text).strip())
         if self._busy:
             # текст озвучивается раньше, чем ход официально закрыт: человек уже
             # услышал ответ и говорит дальше. Не отфутболиваем — придерживаем.
-            self._pending = text
+            self._pending = (text, image)
             self.log.emit("system", "приняла, отвечу следом")
             return
-        self._write(text)
+        self._write(text, image)
 
-    def _write(self, text):
+    def _write(self, text, image=None):
         if not self.alive():                      # процесс умер или ещё не поднят
             self.log.emit("system", "поднимаю claude…")
             self._spawn(wait=True)
             if not self.alive():
                 return
 
-        self._said = ""
+        self._buf = self._said = self._last_msg = ""
+        self._emo = None
         self._set_busy(True)
         self.emotion.emit("think")
+
+        body = text + REMINDER
+        if image:
+            # кадр уходит блоком прямо в потоке. Через файл на диске тоже
+            # работает, но модель тратит лишний ход на чтение — замер показал
+            # 8.7 с против 7.0 с, полторы секунды на ровном месте.
+            content = [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/jpeg",
+                            "data": base64.b64encode(image).decode()}},
+                {"type": "text", "text": body},
+            ]
+        else:
+            content = body
+
         payload = json.dumps({"type": "user",
-                              "message": {"role": "user", "content": text + REMINDER}},
+                              "message": {"role": "user", "content": content}},
                              ensure_ascii=False)
         try:
             self._proc.stdin.write(payload + "\n")
@@ -194,7 +244,22 @@ class AgentRunner(QObject):
                "--input-format", "stream-json",
                "--output-format", "stream-json", "--verbose",
                "--append-system-prompt", SYSTEM_APPEND]
-        if self.cfg.get("disable_mcp", True):
+
+        # хуки — главный пожиратель времени, 3.7 с на ход (tools/bench_modes.py)
+        mode = self.cfg.get("hooks_mode", "skip_user")
+        if mode == "skip_user":
+            # снимаем пользовательские настройки (в них хуки), оставляем проект
+            cmd += ["--setting-sources", "project,local"]
+        elif mode == "safe":
+            # совсем без надстроек: ни хуков, ни плагинов, ни CLAUDE.md
+            cmd += ["--safe-mode"]
+        # mode == "keep" — ничего не трогаем, хуки работают как обычно
+
+        if self.cfg.get("stream_partial", True):
+            # текст по кускам: можно начать говорить с первой готовой фразы,
+            # не дожидаясь, пока модель допишет остальное
+            cmd += ["--include-partial-messages"]
+        if self.cfg.get("disable_mcp", True) and mode != "safe":
             # первый ход с подключёнными MCP-серверами занимал 35 с вместо 12
             cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
         if self.cfg.get("permission_mode"):
@@ -264,6 +329,10 @@ class AgentRunner(QObject):
                 self.session.emit(sid)
             return
 
+        if etype == "stream_event":
+            self._partial(event.get("event") or {})
+            return
+
         if etype == "assistant":
             for block in (event.get("message") or {}).get("content") or []:
                 kind = block.get("type")
@@ -273,28 +342,74 @@ class AgentRunner(QObject):
                 elif kind == "text" and block.get("text", "").strip():
                     # говорим сразу, не дожидаясь result — это экономит ~3 с,
                     # а промежуточное «сейчас посмотрю» голосом звучит естественно
-                    emo, clean = split_emotion(block["text"])
-                    if not clean:
-                        continue
-                    self.emotion.emit(emo or "neutral")
-                    self.log.emit("assistant", clean)
-                    self.speak.emit(clean)
-                    self._said = clean
+                    self._buf = block["text"]
+                    self._flush(final=True)
             return
 
         if etype == "result":
             self._set_busy(False)
             if self._pending:                     # придержанная реплика — вперёд
                 queued, self._pending = self._pending, None
-                threading.Timer(0.1, lambda: self._write(queued)).start()
+                text, image = queued if isinstance(queued, tuple) else (queued, None)
+                threading.Timer(0.1, lambda: self._write(text, image)).start()
                 return
             if event.get("is_error"):
                 self.emotion.emit("unhappy")
                 self.log.emit("error", _short(event.get("result"), 200))
                 return
             text = (event.get("result") or "").strip()
-            emo, clean = split_emotion(text)
-            if clean and clean != self._said:        # финал отличается — договорим
-                self.emotion.emit(emo or "neutral")
-                self.log.emit("assistant", clean)
-                self.speak.emit(clean)
+            _, clean = split_emotion(text)
+            if clean and clean != self._last_msg:    # финал отличается — договорим
+                # в буфер кладём сырой текст: тег эмоции ещё пригодится
+                self._buf, self._said, self._emo = text, "", None
+                self._flush(final=True)
+
+    # ── потоковый разбор ──────────────────────────────────────────────────
+    def _partial(self, ev):
+        """Куски текста по мере поступления — чтобы начать говорить раньше."""
+        kind = ev.get("type")
+        if kind == "message_start":
+            self._buf, self._said, self._emo = "", "", None
+            return
+        if kind == "content_block_delta":
+            piece = (ev.get("delta") or {}).get("text") or ""
+            if piece:
+                self._buf += piece
+                self._flush()
+
+    def _flush(self, final=False):
+        """
+        Отдаёт наружу то, что уже готово: эмоцию — как только распознан тег,
+        текст — законченными предложениями. Дважды одно и то же не произносим:
+        ведём учёт сказанного в self._said.
+        """
+        emo, body = split_emotion(self._buf)
+        if emo and emo != self._emo:
+            self._emo = emo
+            self.emotion.emit(emo)
+
+        body = body.strip()
+        if not body:
+            return
+
+        if final:
+            ready = body
+        else:
+            ends = list(re.finditer(r"[.!?…](?=\s|$)", body))
+            if not ends:
+                return
+            ready = body[:ends[-1].end()].strip()
+
+        if len(ready) <= len(self._said):
+            return
+        fresh = ready[len(self._said):].strip()
+        if not fresh or (not final and len(fresh) < 10):
+            return
+
+        self._said = ready
+        if final:
+            self._last_msg = ready
+            if not self._emo:
+                self.emotion.emit("neutral")
+        self.log.emit("assistant", fresh)
+        self.speak.emit(fresh)
