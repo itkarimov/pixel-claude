@@ -1,0 +1,20 @@
+{
+  "workdir": "C:/UniTap/unitap_wibe_code",
+  "model": "",
+  "permission_mode": "acceptEdits",
+  "disable_mcp": true,
+
+  "voice": "ru-RU-SvetlanaNeural",
+  "tts_rate": "+8%",
+  "speak_actions": false,
+
+  "whisper_model": "small",
+  "whisper_language": "ru",
+  "vad_start_rms": 900,
+  "vad_silence_ms": 900,
+  "vad_min_speech_ms": 400,
+
+  "window_width": 460,
+  "window_height": 880,
+  "portrait_share": 0.6
+}

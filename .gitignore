@@ -1,0 +1,15 @@
+# локальное состояние окна (последняя сессия) и свой реестр сессий
+state.json
+mine.json
+crash.log
+
+# промежуточное: все 40 клеток листа, пересобираются из ref.png
+assets/sheet/
+# служебные снимки для проверки
+assets/_*.png
+
+__pycache__/
+*.pyc
+
+# забракованный арт первой версии, пересобирается tools/gen_character.py
+assets/sprites_generated/
