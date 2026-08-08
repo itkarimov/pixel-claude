@@ -382,6 +382,14 @@ class AgentRunner(QObject):
         Отдаёт наружу то, что уже готово: эмоцию — как только распознан тег,
         текст — законченными предложениями. Дважды одно и то же не произносим:
         ведём учёт сказанного в self._said.
+
+        Один и тот же ответ приходит от CLI трижды — кусками (stream_event),
+        целым блоком (assistant) и финальным событием (result). Отсюда правило:
+        _last_msg проставляется на КАЖДОМ финальном заходе, даже если говорить
+        уже нечего. Иначе получалось так: фраза целиком отзвучала ещё на потоке,
+        обработчик блока вышел раньше как «нового нет» и отметку не поставил,
+        а result увидел пустую отметку и произнёс всё заново. Ответ из двух
+        фраз при этом звучал трижды: каждая фраза отдельно и потом всё вместе.
         """
         emo, body = split_emotion(self._buf)
         if emo and emo != self._emo:
@@ -394,6 +402,9 @@ class AgentRunner(QObject):
 
         if final:
             ready = body
+            self._last_msg = ready          # отметку ставим до всех выходов
+            if not self._emo:
+                self.emotion.emit("neutral")
         else:
             ends = list(re.finditer(r"[.!?…](?=\s|$)", body))
             if not ends:
@@ -407,9 +418,5 @@ class AgentRunner(QObject):
             return
 
         self._said = ready
-        if final:
-            self._last_msg = ready
-            if not self._emo:
-                self.emotion.emit("neutral")
         self.log.emit("assistant", fresh)
         self.speak.emit(fresh)
