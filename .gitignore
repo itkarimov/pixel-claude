@@ -22,3 +22,6 @@ bench_tmp/
 
 # голос локального синтеза, 60 МБ — качается командой из README
 assets/voices/
+
+# модели распознавания в ONNX, 110–609 МБ — tools/get_onnx_model.py
+models/
