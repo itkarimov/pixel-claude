@@ -78,6 +78,79 @@ def api_key(cfg):
             or os.environ.get("META_API_KEY") or "").strip()
 
 
+def list_sessions(limit=40):
+    """
+    Разговоры с Meta AI, свежие сверху — в том же виде, что и сессии claude,
+    чтобы выпадающий список ничего не различал.
+
+    Показываем только то, что оболочка вела сама через API. Переписку с сайта
+    meta.ai сюда не подтянуть: это другой продукт, и доступа к его истории у
+    api.llama.com нет.
+    """
+    out = []
+    try:
+        names = os.listdir(STORE)
+    except OSError:
+        return out
+
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STORE, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        title = (data.get("title") or _first_words(data) or "без названия")
+        out.append({
+            "id": data.get("id") or os.path.splitext(name)[0],
+            "path": path,
+            "title": title,
+            "cwd": "",
+            "named": True,
+            "brain": "llama",
+            "label": f"{title} · Meta AI",
+            "mtime": data.get("at") or os.path.getmtime(path),
+        })
+    out.sort(key=lambda it: it["mtime"], reverse=True)
+    return out[:limit]
+
+
+def _first_words(data):
+    """Заголовок по первой реплике человека — своих названий у Meta AI нет."""
+    for msg in data.get("messages") or []:
+        if msg.get("role") != "user":
+            continue
+        text = msg.get("content")
+        if isinstance(text, list):                  # реплика с картинкой
+            text = " ".join(b.get("text", "") for b in text
+                            if isinstance(b, dict) and b.get("type") == "text")
+        text = " ".join(str(text or "").split())
+        if text:
+            return text[:60]
+    return ""
+
+
+def tail(path, limit=10):
+    """Последние реплики — чтобы лента не открывалась пустой."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    rows = []
+    for msg in (data.get("messages") or [])[-limit:]:
+        text = msg.get("content")
+        if isinstance(text, list):
+            text = " ".join(b.get("text", "") for b in text
+                            if isinstance(b, dict) and b.get("type") == "text")
+        text = " ".join(str(text or "").split())
+        if text:
+            rows.append((msg.get("role") or "user", text[:220]))
+    return rows
+
+
 class LlamaRunner(QObject):
     """Мозг Meta AI. Сигналы и методы — как у AgentRunner."""
 
@@ -297,6 +370,9 @@ class LlamaRunner(QObject):
         self.busy.emit(value)
 
     # ── свои сессии ───────────────────────────────────────────────────────
+    def title(self):
+        return _first_words({"messages": self.history})
+
     def _path(self, session_id):
         return os.path.join(STORE, f"{session_id}.json")
 
@@ -317,6 +393,7 @@ class LlamaRunner(QObject):
             os.makedirs(STORE, exist_ok=True)
             with open(self._path(self.session_id), "w", encoding="utf-8") as fh:
                 json.dump({"id": self.session_id, "at": time.time(),
-                           "messages": self.history}, fh, ensure_ascii=False)
+                           "title": self.title(), "messages": self.history},
+                          fh, ensure_ascii=False)
         except OSError:
             pass

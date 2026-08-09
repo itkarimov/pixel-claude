@@ -130,12 +130,61 @@ def c_ui():
     return "переключается и откатывается без лишних сигналов"
 
 
+def c_sessions():
+    """Разговоры Meta AI попадают в список в том же виде, что и claude-овские."""
+    import shutil
+    import time as _t
+    from core import llama as L
+    from core import sessions as S
+
+    backup = L.STORE + ".test_backup"
+    had = os.path.isdir(L.STORE)
+    if had:
+        shutil.move(L.STORE, backup)
+    try:
+        os.makedirs(L.STORE, exist_ok=True)
+        for n, (sid, first) in enumerate((("aaa111", "Привет, как дела?"),
+                                          ("bbb222", "Расскажи про Кыргызстан"))):
+            with open(os.path.join(L.STORE, f"{sid}.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"id": sid, "at": _t.time() + n,
+                           "messages": [{"role": "user", "content": first},
+                                        {"role": "assistant", "content": "[done] Ага."}]},
+                          fh, ensure_ascii=False)
+
+        items = L.list_sessions()
+        if len(items) != 2:
+            raise RuntimeError(f"нашлось {len(items)} вместо 2")
+        if items[0]["id"] != "bbb222":
+            raise RuntimeError("порядок не по свежести")
+        if items[0]["label"] != "Расскажи про Кыргызстан · Meta AI":
+            raise RuntimeError(f"подпись: {items[0]['label']}")
+        if any(it.get("brain") != "llama" for it in items):
+            raise RuntimeError("сессии не помечены мозгом")
+
+        shape = set(S.list_sessions(limit=1)[0]) if S.list_sessions(limit=1) else set()
+        if shape and not shape <= set(items[0]):
+            raise RuntimeError("поля разошлись с claude: "
+                               + ", ".join(sorted(shape - set(items[0]))))
+
+        rows = L.tail(items[0]["path"])
+        if rows != [("user", "Расскажи про Кыргызстан"),
+                    ("assistant", "[done] Ага.")]:
+            raise RuntimeError(f"хвост: {rows}")
+        return f"{len(items)} разговора, поля совпадают с claude"
+    finally:
+        shutil.rmtree(L.STORE, ignore_errors=True)
+        if had:
+            shutil.move(backup, L.STORE)
+
+
 print("── переключение мозга ──")
 check("поток, форма openai", c_stream_openai)
 check("поток, форма llama", c_stream_native)
 check("озвучка предложениями", c_flush)
 check("без ключа не врёт", c_no_key)
 check("интерфейс совпадает с claude", c_same_interface)
+check("список разговоров Meta AI", c_sessions)
 check("кнопка в ленте", c_ui)
 
 print()

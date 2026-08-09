@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (QApplication, QMenu,     # noqa: E402
 from core import sessions                               # noqa: E402
 from core.agent import AgentRunner                      # noqa: E402
 from core.confirm import Confirmer                      # noqa: E402
+from core import llama                                  # noqa: E402
 from core.llama import LlamaRunner                      # noqa: E402
 from core.stt import Listener                           # noqa: E402
 from core.tts import Speaker                            # noqa: E402
@@ -200,7 +201,7 @@ class Shell(QObject):
             self.win.chat.append("system", "мозг: Claude")
             if not self.agent.alive():
                 self.agent.start()
-        self.win.chat.set_sessions(self.items, self.brain.session_id)
+        self.on_list(self._collect_sessions())      # у каждого мозга свой список
 
     # ── трей ──────────────────────────────────────────────────────────────
     def _tray(self):
@@ -275,6 +276,7 @@ class Shell(QObject):
             brain.speak.connect(self.speaker.say)
             brain.busy.connect(self.on_busy)
         self.agent.session.connect(self.on_session_created)
+        self.llama.session.connect(self.on_llama_session)
 
         self.listener.heard.connect(self.on_heard)
         self.listener.status.connect(w.chat.set_status)
@@ -311,10 +313,15 @@ class Shell(QObject):
         state = load_state()
         self.items = []
         if state.get("session_id"):
-            self.agent.set_session(state["session_id"], state.get("cwd"))
+            # мозг запоминаем вместе с сессией: id от Meta AI для claude
+            # бессмыслен, --resume на него не встанет
+            self.backend = state.get("brain") or "claude"
+            self.win.chat.set_brain(self.backend)
+            self.brain.set_session(state["session_id"], state.get("cwd"))
             chat.append("system", f"продолжаю: {state.get('title') or 'прошлая сессия'}")
             if state.get("path"):
-                self._load_tail({"id": state["session_id"], "path": state["path"]})
+                self._load_tail({"id": state["session_id"], "path": state["path"],
+                                 "brain": self.backend})
         else:
             chat.append("system", "включи микрофон и говори")
 
@@ -326,14 +333,24 @@ class Shell(QObject):
             self.last_prompt = text
 
     # ── сессии ────────────────────────────────────────────────────────────
+    def _collect_sessions(self):
+        """
+        Список для того мозга, что сейчас отвечает. У каждого он свой и
+        смешивать их нельзя: у claude это сайдбар приложения, у Meta AI —
+        наши собственные разговоры в llama_sessions.
+        """
+        if self.backend == "llama":
+            return llama.list_sessions(limit=60)
+        return sessions.list_sessions(limit=60)
+
     def _reload_sessions(self):
-        """Перечитывает реестр приложения в потоке — окно на это не замирает."""
+        """Перечитывает список в потоке — окно на это не замирает."""
         threading.Thread(target=lambda: self.list_loaded.emit(
-            sessions.list_sessions(limit=60)), daemon=True).start()
+            self._collect_sessions()), daemon=True).start()
 
     def on_sessions_needed(self):
-        """Открывают список — перечитываем реестр приложения (~30 мс)."""
-        self.on_list(sessions.list_sessions(limit=60))
+        """Открывают список — перечитываем (~30 мс), чтобы не отставал."""
+        self.on_list(self._collect_sessions())
 
     def on_list(self, items):
         self.items = items
@@ -345,12 +362,15 @@ class Shell(QObject):
 
     def _remember(self, item):
         save_state({"session_id": item["id"], "cwd": item.get("cwd"),
-                    "path": item.get("path"), "title": item.get("title")})
+                    "path": item.get("path"), "title": item.get("title"),
+                    "brain": item.get("brain") or "claude"})
 
     def _load_tail(self, item):
         """Хвост читаем в потоке: файл активной сессии бывает на мегабайты."""
+        read = llama.tail if (item.get("brain") == "llama") else sessions.tail
+
         def work():
-            self.tail_loaded.emit(item["id"], sessions.tail(item["path"]))
+            self.tail_loaded.emit(item["id"], read(item["path"]))
         threading.Thread(target=work, daemon=True).start()
 
     def on_tail(self, session_id, rows):
@@ -366,12 +386,12 @@ class Shell(QObject):
         self.speaker.shutup()
         self.eyes.forget()
         self.watcher.forget()          # в чужом контексте кадра ещё не видели
-        if self.backend != "claude":
-            # список — это сайдбар приложения Claude, чужие сессии Meta AI
-            # не откроет: выбор сессии сам возвращает на Клода
-            self.backend = "claude"
-            self.win.chat.set_brain("claude")
-        self.agent.set_session(item["id"], item["cwd"])
+        # сессия сама знает, чей она мозг — выбор из списка его и включает
+        want = item.get("brain") or "claude"
+        if want != self.backend:
+            self.backend = want
+            self.win.chat.set_brain(want)
+        self.brain.set_session(item["id"], item.get("cwd"))
         self.win.chat.clear()
         folder = os.path.basename((item["cwd"] or "").rstrip("\\/"))
         self.win.chat.append("system", f"{item['title']} · папка {folder}")
@@ -403,6 +423,15 @@ class Shell(QObject):
                 "title": (self.last_prompt or "новый разговор")[:60]}
         save_state({**item, "session_id": session_id})
         self.win.chat.set_sessions(self.items, session_id)
+
+    def on_llama_session(self, session_id):
+        """Meta AI завела разговор — запоминаем, чтобы поднять его при запуске."""
+        save_state({"session_id": session_id, "cwd": "", "brain": "llama",
+                    "path": os.path.join(ROOT, "llama_sessions",
+                                         f"{session_id}.json"),
+                    "title": (self.last_prompt or "разговор с Meta AI")[:60]})
+        if self.backend == "llama":
+            self.win.chat.set_sessions(self.items, session_id)
 
     # ── события ───────────────────────────────────────────────────────────
     def on_mic(self, on):
