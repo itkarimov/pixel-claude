@@ -90,6 +90,34 @@ TOOL_RU = {
 }
 
 
+# Имена, которые в открытой папке читать нельзя. Прочитанное уходит в модель и
+# звучит вслух: ключ, один раз попавший в разговор, оттуда уже не убрать.
+SECRET_GLOBS = (".env", ".env.*", "*.env", "*key*", "*.pem", "*.p12", "*.pfx",
+                ".mcp.json", "credentials*", "token*.json", "*secret*")
+
+
+def deny_rules(dirs):
+    """
+    Запреты чтения секретов для каждой открытой папки.
+
+    Формат путей выяснен замером (tools/deny_test.py), и он неочевиден:
+    относительные маски вида `Read(**/*deploy_key*)` **не работают вовсе** —
+    с ними claude спокойно печатает приватный ключ. Срабатывает только
+    абсолютный путь в форме `//c/Trading/…`. Правило пишем и для самой папки,
+    и для вложенных.
+    """
+    rules = []
+    for path in dirs:
+        full = os.path.abspath(os.path.expanduser(path))
+        drive, rest = os.path.splitdrive(full)
+        base = "//" + drive.rstrip(":").lower() + rest.replace("\\", "/")
+        base = base.rstrip("/")
+        for glob in SECRET_GLOBS:
+            rules.append(f"Read({base}/{glob})")
+            rules.append(f"Read({base}/**/{glob})")
+    return rules
+
+
 def _short(value, limit=58):
     text = str(value).replace("\n", " ").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -276,6 +304,18 @@ class AgentRunner(QObject):
         allowed = self.cfg.get("allowed_tools")
         if allowed:
             cmd += ["--allowedTools"] + list(allowed)
+        # Папки за пределами рабочей: без них она честно отвечает «доступа нет».
+        # Существующие проверяем сами — на несуществующей CLI падает при старте,
+        # а выглядит это как «оболочка не поднялась».
+        extra = [d for d in (self.cfg.get("extra_dirs") or [])
+                 if os.path.isdir(os.path.expanduser(d))]
+        if extra:
+            cmd += ["--add-dir"] + extra
+        # Запреты сильнее разрешений. Секреты в открытых папках закрываем сами,
+        # не полагаясь на конфиг: открыли папку — защита появилась вместе с ней.
+        denied = deny_rules(extra) + list(self.cfg.get("denied_tools") or [])
+        if denied:
+            cmd += ["--disallowedTools"] + denied
         if self.cfg.get("permission_mode"):
             cmd += ["--permission-mode", self.cfg["permission_mode"]]
         if self.cfg.get("model"):
