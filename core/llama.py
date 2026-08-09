@@ -73,6 +73,7 @@ REMINDER = ("\n\n[оболочка] Ответь одной-двумя фраз�
 
 HISTORY_TURNS = 20          # сколько прошлых реплик тащим в запрос
 MAX_TOKENS = 2000           # с запасом: размышления модели идут из этого же бюджета
+EFFORT = "minimal"          # сколько модели думать: вчетверо дешевле обычного
 SENTENCE_END = re.compile(r"[.!?…](?=\s|$)")
 
 
@@ -284,6 +285,13 @@ class LlamaRunner(QObject):
                    "messages": messages, "stream": True,
                    "max_completion_tokens": int(self.cfg.get("llama_max_tokens")
                                                 or MAX_TOKENS)}
+        # Платим в основном за размышления, а не за ответ. Замер на «как дела?»
+        # (tools/llama_cost.py): без настройки 421 токен на выходе, low — 354,
+        # minimal — 101, и ответ во всех случаях один и тот же. Значение "none"
+        # модель не принимает.
+        effort = self.cfg.get("llama_reasoning_effort", EFFORT)
+        if effort:
+            payload["reasoning_effort"] = effort
         headers = {"Authorization": f"Bearer {api_key(self.cfg)}",
                    "Content-Type": "application/json"}
 
