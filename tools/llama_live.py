@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PySide6.QtCore import QCoreApplication, QTimer     # noqa: E402
 
 from app import load_config                             # noqa: E402
-from core.llama import LlamaRunner, api_key             # noqa: E402
+from core.llama import LlamaRunner, api_key, endpoint   # noqa: E402
 
 QUESTION = "Привет! Скажи одной фразой, как ты себя чувствуешь."
 
@@ -27,7 +27,7 @@ def main():
     key = api_key(cfg)
     print(f"ключ: {'есть, ' + key[:8] + '…' if key else 'НЕТ'}")
     print(f"модель: {cfg.get('llama_model')}")
-    print(f"адрес: {cfg.get('llama_api_url')}\n")
+    print(f"адрес: {endpoint(cfg)}\n")
     if not key:
         print("[ПЛОХО] без ключа проверять нечего")
         return 1

@@ -9,10 +9,12 @@
   "allowed_tools": ["WebSearch", "WebFetch"],
   "disable_mcp": true,
 
-  "_второй_мозг": "Кнопка МОЗГ внизу ленты переключает на Meta AI (Llama). Ключ можно не писать сюда, а задать переменной окружения LLAMA_API_KEY или META_API_KEY. Получить: https://llama.developer.meta.com. У Meta AI нет инструментов — ни файлов, ни команд, ни поиска.",
+  "_второй_мозг": "Кнопка МОЗГ внизу ленты переключает на Meta AI. Ключ можно не писать сюда, а задать переменной окружения LLAMA_API_KEY или META_API_KEY. Получить: https://ai.developer.meta.com. У Meta AI нет инструментов — ни файлов, ни команд, ни поиска. Старый api.llama.com закрыт 6 июля 2026 и на любой ключ отвечает 401 — не путать с плохим ключом.",
   "llama_api_key": "",
-  "llama_model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
-  "llama_api_url": "https://api.llama.com/v1/chat/completions",
+  "llama_model": "muse-spark-1.2",
+  "llama_api_url": "https://api.meta.ai/v1",
+  "_лимит": "muse-spark сначала думает, и размышления идут из того же бюджета: на короткое «как дела?» ушло 405 токенов размышлений и 16 на ответ. Ставить меньше 1000 нельзя — придёт пустой ответ и молчание.",
+  "llama_max_tokens": 2000,
 
   "_скорость": "hooks_mode: skip_user — не грузить пользовательские настройки, где лежат хуки (они стоят 3.7 с на реплику). safe — вообще без надстроек, включая CLAUDE.md. keep — как обычно, медленно.",
   "hooks_mode": "skip_user",

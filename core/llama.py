@@ -38,8 +38,11 @@ from core.agent import EMOTIONS, split_emotion
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORE = os.path.join(ROOT, "llama_sessions")
 
-DEFAULT_URL = "https://api.llama.com/v1/chat/completions"
-DEFAULT_MODEL = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+# Старый Llama API (api.llama.com) Meta закрыла 6 июля 2026 — на любой ключ он
+# отвечает 401 «Authentication Error», и это легко принять за плохой ключ.
+# Живой адрес — Meta Model API, модели семейства muse-spark.
+DEFAULT_URL = "https://api.meta.ai/v1/chat/completions"
+DEFAULT_MODEL = "muse-spark-1.2"
 
 # Приписка своя, а не claude-овская: там половина про инструменты и поиск,
 # которых здесь нет, и обещать их — значит врать голосом.
@@ -69,7 +72,20 @@ REMINDER = ("\n\n[оболочка] Ответь одной-двумя фраз�
             + " ".join(f"[{e}]" for e in sorted(EMOTIONS)))
 
 HISTORY_TURNS = 20          # сколько прошлых реплик тащим в запрос
+MAX_TOKENS = 2000           # с запасом: размышления модели идут из этого же бюджета
 SENTENCE_END = re.compile(r"[.!?…](?=\s|$)")
+
+
+def endpoint(cfg):
+    """
+    Полный адрес запроса. В документации адрес дают то целиком, то базой
+    (`https://api.llama.com/compat/v1`) — принимаем оба, иначе POST уходит
+    мимо и сервер отвечает не пойми чем.
+    """
+    url = (cfg.get("llama_api_url") or DEFAULT_URL).strip().rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url += "/chat/completions"
+    return url
 
 
 def api_key(cfg):
@@ -259,17 +275,25 @@ class LlamaRunner(QObject):
                     + self.history[-HISTORY_TURNS:]
                     + [{"role": "user", "content": content}])
 
-        url = self.cfg.get("llama_api_url") or DEFAULT_URL
+        url = endpoint(self.cfg)
+        # Лимит щедрый не от жадности: muse-spark сначала думает, и размышления
+        # идут из того же бюджета. Замер на фразе «как дела?» — 405 токенов
+        # размышлений и 16 на сам ответ; при лимите 400 текста не остаётся вовсе,
+        # приходит пустой content и молчание в ответ.
         payload = {"model": self.cfg.get("llama_model") or DEFAULT_MODEL,
                    "messages": messages, "stream": True,
-                   "max_completion_tokens": 400}
+                   "max_completion_tokens": int(self.cfg.get("llama_max_tokens")
+                                                or MAX_TOKENS)}
         headers = {"Authorization": f"Bearer {api_key(self.cfg)}",
                    "Content-Type": "application/json"}
 
         resp = requests.post(url, headers=headers, json=payload,
-                             stream=True, timeout=(10, 120))
+                             stream=True, timeout=(10, 180))
         if resp.status_code >= 400:
             raise RuntimeError(self._explain(resp))
+        # У потока событий charset в заголовке не приходит, и requests по
+        # умолчанию читает его как latin-1 — русский превращается в кашу.
+        resp.encoding = "utf-8"
 
         said, buf, emo = "", "", None
         for piece in self._stream(resp):
