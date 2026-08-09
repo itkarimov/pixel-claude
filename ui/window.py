@@ -442,8 +442,8 @@ class MainWindow(QWidget):
         super().__init__()
         self.allow_quit = False
         self.setWindowTitle("Pixel Claude")
-        self.resize(int(cfg.get("window_width", 460)),
-                    int(cfg.get("window_height", 880)))
+        self.resize(int(cfg.get("window_width", 368)),
+                    int(cfg.get("window_height", 704)))
         self.setMinimumSize(340, 600)
         self.setStyleSheet(f"background:{BG};")
 
