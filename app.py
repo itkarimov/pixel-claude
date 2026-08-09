@@ -31,10 +31,6 @@ from ui.window import MainWindow                        # noqa: E402
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(ROOT, "state.json")
 CRASH = os.path.join(ROOT, "crash.log")
-# Свой реестр сессий, заведённых из оболочки. Приложение Claude держит сайдбар
-# по собственной базе (IndexedDB) со своими id — сессию, созданную снаружи, оно
-# не увидит. Чтобы такие разговоры не пропадали хотя бы здесь, ведём их сами.
-MINE = os.path.join(ROOT, "mine.json")
 
 # Просьбы, на которые словесное описание не годится: если человек просит
 # посмотреть прямо сейчас, фраза двадцатисекундной давности — это враньё,
@@ -104,37 +100,6 @@ def _write_json(path, data):
         pass
 
 
-def load_mine():
-    try:
-        with open(MINE, encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, list) else []
-    except (OSError, ValueError):
-        return []
-
-
-def remember_mine(item):
-    """Дописывает сессию оболочки в свой реестр, без дублей."""
-    items = [x for x in load_mine() if x.get("id") != item["id"]]
-    items.insert(0, item)
-    _write_json(MINE, items[:60])
-
-
-def merge_sessions(app_items):
-    """Список приложения плюс свои сессии, свежие сверху."""
-    known = {it["id"] for it in app_items}
-    out = list(app_items)
-    for mine in load_mine():
-        if mine.get("id") in known or not os.path.exists(mine.get("path") or ""):
-            continue
-        folder = os.path.basename((mine.get("cwd") or "").rstrip("\\/"))
-        title = mine.get("title") or "без названия"
-        out.append({**mine, "named": False, "mine": True,
-                    "label": f"▸ {title}" + (f" · {folder}" if folder else ""),
-                    "mtime": os.path.getmtime(mine["path"])})
-    return sorted(out, key=lambda it: it["mtime"], reverse=True)
-
-
 class Shell(QObject):
     tail_loaded = Signal(str, list)      # (session_id, [(вид, текст), ...])
     list_loaded = Signal(list)           # список сессий, собранный в фоне
@@ -152,7 +117,7 @@ class Shell(QObject):
         self.busy = False
         self.saved_frames = 0        # сколько кадров не отправили как повтор
         self.tray = None
-        self.app_items = []          # список из приложения, без своих сессий
+        self.items = []              # сессии из сайдбара приложения
         self.last_prompt = ""        # им озаглавим сессию, если её заведут сейчас
 
         self._wire()
@@ -223,6 +188,7 @@ class Shell(QObject):
         w.chat.submitted.connect(self.on_input)
         w.chat.session_picked.connect(self.on_session_picked)
         w.chat.session_new.connect(self.on_session_new)
+        w.chat.sessions_needed.connect(self.on_sessions_needed)
         self.tail_loaded.connect(self.on_tail)
         self.list_loaded.connect(self.on_list)
 
@@ -276,20 +242,24 @@ class Shell(QObject):
             chat.append("system", "включи микрофон и говори")
 
         chat.set_status("собираю список сессий…")
-        # Показываем всё, включая безымянные прогоны CLI: приложение их прячет,
-        # а здесь они нужны — иначе голосовые сессии оболочки не найти.
-        threading.Thread(target=lambda: self.list_loaded.emit(
-            sessions.list_sessions(limit=60, unnamed=True, unnamed_limit=60)),
-            daemon=True).start()
+        self._reload_sessions()
 
     def _note_prompt(self, kind, text):
         if kind == "user":
             self.last_prompt = text
 
     # ── сессии ────────────────────────────────────────────────────────────
+    def _reload_sessions(self):
+        """Перечитывает реестр приложения в потоке — окно на это не замирает."""
+        threading.Thread(target=lambda: self.list_loaded.emit(
+            sessions.list_sessions(limit=60)), daemon=True).start()
+
+    def on_sessions_needed(self):
+        """Открывают список — перечитываем реестр приложения (~30 мс)."""
+        self.on_list(sessions.list_sessions(limit=60))
+
     def on_list(self, items):
-        self.app_items = items
-        self.items = merge_sessions(items)
+        self.items = items
         self.win.chat.set_sessions(self.items, self.agent.session_id)
         self.win.chat.set_status("готова")
 
@@ -340,14 +310,16 @@ class Shell(QObject):
         self.win.chat.set_sessions(self.items, None)
 
     def on_session_created(self, session_id):
-        """claude завёл новую сессию — заносим в свой реестр и в список."""
+        """
+        claude завёл новую сессию. В списке её не будет: список — это сайдбар
+        приложения, а туда сессия снаружи не попадает. Показываем её отдельной
+        строкой «текущая» и запоминаем в state.json, чтобы поднять при запуске.
+        """
         item = {"id": session_id, "cwd": self.agent.workdir,
                 "path": os.path.join(sessions.project_dir(self.agent.workdir),
                                      f"{session_id}.jsonl"),
                 "title": (self.last_prompt or "новый разговор")[:60]}
         save_state({**item, "session_id": session_id})
-        remember_mine(item)
-        self.items = merge_sessions(self.app_items)
         self.win.chat.set_sessions(self.items, session_id)
 
     # ── события ───────────────────────────────────────────────────────────

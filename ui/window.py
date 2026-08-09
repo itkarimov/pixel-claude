@@ -295,16 +295,35 @@ class ConfirmBar(QWidget):
         self.show()
 
 
+class SessionPicker(QComboBox):
+    """
+    Список сессий, который перечитывается в момент открытия.
+
+    Нужно ради удаления: сессию убирают в приложении Claude, и она должна
+    пропасть здесь сразу, а не после перезапуска оболочки. Сборка списка стоит
+    ~30 мс (реестр приложения — это десятки маленьких json), так что делаем её
+    синхронно, до показа выпадашки, и никакого мигания не видно.
+    """
+
+    about_to_open = Signal()
+
+    def showPopup(self):
+        self.about_to_open.emit()
+        super().showPopup()
+
+
 class Chat(QWidget):
     """Лента сессии: что сказали, что делаем, что ответили."""
 
     submitted = Signal(str)
     session_picked = Signal(str)      # выбрана сессия из списка
     session_new = Signal()            # начать с чистого листа
+    sessions_needed = Signal()        # открывают список — перечитай реестр
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.picker = QComboBox()
+        self.picker = SessionPicker()
+        self.picker.about_to_open.connect(self.sessions_needed.emit)
         self.picker.setCursor(Qt.PointingHandCursor)
         self.picker.setStyleSheet(f"""
             QComboBox {{

@@ -1,15 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Список сессий — тот же, что в сайдбаре приложения Claude.
+Список сессий — ровно тот, что в сайдбаре приложения Claude.
 
-Приложение держит свой реестр в IndexedDB, но лезть туда не нужно: заголовок,
-который вы задали в приложении, оно дублирует записью `custom-title` прямо в
-файл CLI-сессии. Оттуда и берём.
+Приложение ведёт свой список обычными json-файлами, по одному на сессию:
 
-    ~/.claude/projects/<путь проекта с дефисами>/<session_id>.jsonl
+    %APPDATA%/Claude/claude-code-sessions/<аккаунт>/<устройство>/
+        local_<uuid>.json     запись о сессии, поле cliSessionId — имя файла
+                              транскрипта в ~/.claude/projects/<проект>/
+        deleted_<uuid>        метка удаления; <uuid> — тот самый cliSessionId
+        scheduled-tasks.json  задачи по расписанию, не сессии
 
-Сессии собираются по всем проектам сразу, у каждой своя рабочая папка (поле
-`cwd` в записях) — выбрали сессию, оболочка переключилась туда же.
+Отсюда два важных следствия, ради которых всё и переписано:
+
+  * Удаляя сессию в приложении, вы **не удаляете файл транскрипта** — уходит
+    только запись реестра и появляется метка. Поэтому список нельзя строить по
+    файлам в ~/.claude/projects: удалённое оттуда никуда не денется. По реестру —
+    денется само, без всякой синхронизации.
+  * Заголовок лежит прямо в записи, и хвост многомегабайтного транскрипта ради
+    строки `custom-title` вычитывать больше не надо. Раньше на это уходили
+    секунды при запуске.
+
+Что приложение в сайдбаре не показывает и мы тоже не показываем: архив
+(`isArchived`) и прогоны по расписанию (`scheduledTaskId` — их бывает десяток
+с одинаковым названием). Записи без транскрипта на диске пропускаем: открыть
+такую всё равно нечем.
+
+Если приложения Claude на машине нет, реестра тоже нет — тогда работает запасной
+путь: сканирование файлов проектов, как было раньше.
 """
 import glob
 import json
@@ -24,12 +41,19 @@ EMOTION_RE = re.compile(r"^\s*\[\w+\]\s*")
 HEAD_LINES = 400          # сколько строк с начала читать ради cwd и первой реплики
 TAIL_WINDOWS = (262_144, 2_097_152, 16_777_216)   # окна поиска custom-title с конца
 
-SCAN_CAP = 800            # потолок обхода: дальше в прошлое список всё равно не листают
+SCAN_CAP = 800            # потолок обхода в запасном пути
 SKIP_DIRS = ("claude-mem-observer-sessions",)     # фоновые агенты памяти, не наши сессии
+
+DELETED = "deleted_"
 
 
 def projects_root():
     return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+
+
+def registry_root():
+    """Реестр сайдбара приложения. Пусто, если приложение не установлено."""
+    return os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code-sessions")
 
 
 def project_dir(workdir):
@@ -55,6 +79,73 @@ def _clean(text):
     text = REMINDER_RE.sub("", text or "")
     return " ".join(EMOTION_RE.sub("", text).split()).strip()
 
+
+# ── список из реестра приложения ──────────────────────────────────────────────
+
+def _transcripts():
+    """{id сессии: путь к .jsonl} по всем проектам. Только имена, файлы не читаем."""
+    found = {}
+    for path in glob.glob(os.path.join(projects_root(), "*", "*.jsonl")):
+        if any(d in path for d in SKIP_DIRS):
+            continue
+        found.setdefault(os.path.splitext(os.path.basename(path))[0], path)
+    return found
+
+
+def _registry():
+    """Записи сайдбара и метки удаления. None, если реестра на машине нет."""
+    root = registry_root()
+    if not os.path.isdir(root):
+        return None, set()
+
+    rows = []
+    for path in glob.glob(os.path.join(root, "*", "*", "local_*.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue                      # запись пишется прямо сейчас — пропустим
+        if isinstance(rec, dict) and rec.get("cliSessionId"):
+            rows.append(rec)
+
+    tombs = {os.path.basename(p)[len(DELETED):]
+             for p in glob.glob(os.path.join(root, "*", "*", DELETED + "*"))}
+    return rows, tombs
+
+
+def _from_registry(rows, tombs, limit, workdir, scheduled):
+    files = _transcripts()
+    out = []
+    for rec in rows:
+        sid = rec["cliSessionId"]
+        path = files.get(sid)
+        if not path or sid in tombs:
+            continue                      # удалена в приложении или нечего открывать
+        if rec.get("isArchived"):
+            continue
+        if rec.get("scheduledTaskId") and not scheduled:
+            continue
+        cwd = rec.get("cwd") or rec.get("originCwd") or ""
+        if workdir and os.path.abspath(cwd) != os.path.abspath(workdir):
+            continue
+        title = (rec.get("title") or "без названия").strip()
+        folder = os.path.basename(cwd.rstrip("\\/"))
+        out.append({
+            "id": sid,
+            "path": path,
+            "title": title,
+            "cwd": cwd,
+            "named": True,
+            "label": f"{title} · {folder}" if folder else title,
+            # порядок как в сайдбаре: приложение сортирует по последнему открытию
+            "mtime": (rec.get("lastFocusedAt") or rec.get("lastActivityAt")
+                      or rec.get("createdAt") or 0) / 1000.0,
+        })
+    out.sort(key=lambda it: it["mtime"], reverse=True)
+    return out[:limit]
+
+
+# ── запасной путь: сканирование файлов проектов ───────────────────────────────
 
 def _scan_head(path):
     """Первая реплика и рабочая папка — они лежат в начале файла."""
@@ -116,18 +207,8 @@ def _scan_tail(path):
     return title, cwd
 
 
-def list_sessions(limit=40, workdir=None, unnamed=False, unnamed_limit=60):
-    """
-    Сессии, свежие сверху. Именованные — те же, что в сайдбаре приложения.
-    Безымянные (прогоны CLI, голосовые сессии оболочки) приложение прячет, здесь
-    их подмешивает unnamed=True, взяв в заголовок первую реплику.
-
-    Лимиты раздельные намеренно: безымянных на диске втрое больше, и на общем
-    счётчике они выдавливали бы рабочие сессии из списка.
-
-    Сначала сортируем по времени файла (дёшево, только stat), читаем верхушку и
-    останавливаемся, набрав оба лимита — иначе на сотнях сессий запуск бы тормозил.
-    """
+def _from_files(limit, workdir):
+    """Как было до реестра: именованные сессии, заголовок из хвоста транскрипта."""
     pattern = os.path.join(project_dir(workdir) if workdir else projects_root(),
                            "*.jsonl" if workdir else os.path.join("*", "*.jsonl"))
     try:
@@ -136,40 +217,40 @@ def list_sessions(limit=40, workdir=None, unnamed=False, unnamed_limit=60):
         return []
 
     out = []
-    n_named = n_unnamed = 0
     for path in paths[:SCAN_CAP]:
-        if n_named >= limit and (not unnamed or n_unnamed >= unnamed_limit):
+        if len(out) >= limit:
             break
         if any(d in path for d in SKIP_DIRS):
             continue
         title, cwd = _scan_tail(path)
-        first = ""
-        if title:
-            if n_named >= limit:
-                continue
-        else:
-            if not unnamed or n_unnamed >= unnamed_limit:
-                continue
-            first, head_cwd = _scan_head(path)
-            cwd = cwd or head_cwd
-            if not first:
-                continue
-        if title:
-            n_named += 1
-        else:
-            n_unnamed += 1
-        name = title or first[:60]
+        if not title:
+            continue
         folder = os.path.basename(cwd.rstrip("\\/")) if cwd else ""
         out.append({
             "id": os.path.splitext(os.path.basename(path))[0],
             "path": path,
-            "title": name,
+            "title": title,
             "cwd": cwd,
-            "named": bool(title),
-            "label": f"{name} · {folder}" if folder else name,
+            "named": True,
+            "label": f"{title} · {folder}" if folder else title,
             "mtime": os.path.getmtime(path),
         })
     return out
+
+
+def list_sessions(limit=40, workdir=None, scheduled=False):
+    """
+    Сессии, свежие сверху — те же и в том же порядке, что в сайдбаре приложения.
+
+    Удалили сессию в приложении — она пропадёт и здесь при следующем чтении:
+    список строится по реестру приложения, а не по файлам на диске.
+
+    scheduled=True добавляет прогоны по расписанию (в сайдбаре их нет).
+    """
+    rows, tombs = _registry()
+    if rows is None:
+        return _from_files(limit, workdir)
+    return _from_registry(rows, tombs, limit, workdir, scheduled)
 
 
 def tail(path, limit=10):
