@@ -240,7 +240,9 @@ class Portrait(QWidget):
             # левый нижний угол, вровень с кнопками: лицо должно оставаться
             # открытым, а глазок — рядом с кнопкой, которая его включает
             ex = x + 10
-            ey = min(self.mic.y() + self.mic.height() - eh, y + h - eh - 10)
+            # над кнопками, а не вровень с ними: в узком окне кнопка ГЛАЗА
+            # доезжает до левого края и предпросмотр оказывался под ней
+            ey = max(y + 10, min(self.mic.y() - eh - 8, y + h - eh - 10))
             p.fillRect(ex - 3, ey - 3, ew + 6, eh + 6, QColor(PANEL))
             p.drawPixmap(ex, ey, ew, eh, self._eye)
             p.setPen(accent)
@@ -442,7 +444,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.allow_quit = False
         self.setWindowTitle("Pixel Claude")
-        self.resize(int(cfg.get("window_width", 368)),
+        self.resize(int(cfg.get("window_width", 552)),
                     int(cfg.get("window_height", 704)))
         self.setMinimumSize(340, 600)
         self.setStyleSheet(f"background:{BG};")

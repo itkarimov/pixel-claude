@@ -48,7 +48,7 @@
   "confirm_mode": "voice",
   "confirm_timeout_sec": 30,
 
-  "window_width": 368,
+  "window_width": 552,
   "window_height": 704,
   "portrait_share": 0.6
 }

@@ -14,6 +14,41 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def claim_single_instance():
+    """
+    Пускает только одну копию. True — мы первые, False — надо уйти.
+
+    Держим именованный мьютекс Windows: он живёт вместе с процессом и исчезает
+    сам, даже если приложение убили, — в отличие от файла-замка, после которого
+    пришлось бы разбираться с чужим PID.
+
+    Проверка стоит здесь, до импорта PySide6 и остального: они грузятся
+    несколько секунд, и если брать мьютекс в main(), двойной клик по ярлыку
+    успевает проскочить — обе копии считают себя первыми.
+    """
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW(None, False, "PixelClaude.single.instance")
+    if kernel32.GetLastError() != 183:          # ERROR_ALREADY_EXISTS
+        return True                             # мьютекс нарочно не закрываем
+
+    # Копия уже работает — поднимаем её окно, иначе человек решит, что ярлык
+    # не сработал, и будет жать снова.
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, "Pixel Claude")
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)              # SW_RESTORE — достать из трея
+        user32.SetForegroundWindow(hwnd)
+    return False
+
+
+if __name__ == "__main__" and not claim_single_instance():
+    sys.exit(0)
+
 from PySide6.QtCore import QObject, QTimer, Signal      # noqa: E402
 from PySide6.QtGui import QAction, QIcon                # noqa: E402
 from PySide6.QtWidgets import (QApplication, QMenu,     # noqa: E402

@@ -98,6 +98,36 @@ class Eyes(QObject):
 
     # ── кадры ─────────────────────────────────────────────────────────────
     def _worker(self):
+        """
+        Обёртка над съёмкой. Всё тело в try не для красоты: драйвер камеры
+        бросает наружу C++-исключение OpenCV (`Unknown C++ exception`), которое
+        не ловится проверкой isOpened(). Без обёртки поток умирал молча, camera
+        оставалась захваченной, а кнопка ГЛАЗА — включённой навсегда.
+        """
+        cap = None
+        try:
+            cap = self._capture()
+        except Exception as exc:                     # noqa: BLE001 — драйвер бросает что угодно
+            self.status.emit(f"камера не завелась ({type(exc).__name__})")
+        if cap is None:
+            self._run = False
+            self.active.emit(False)
+            return
+
+        try:
+            self._loop(cap)
+        except Exception as exc:                     # noqa: BLE001
+            self.status.emit(f"камера отвалилась ({type(exc).__name__})")
+        finally:
+            self._run = False
+            try:
+                cap.release()
+            except Exception:                        # noqa: BLE001
+                pass
+            self.active.emit(False)
+
+    def _capture(self):
+        """Открывает камеру. None — не получилось, причина уже сказана вслух."""
         import cv2
 
         backend = getattr(cv2, f"CAP_{self.cfg.get('camera_backend', 'DSHOW')}",
@@ -107,22 +137,34 @@ class Eyes(QObject):
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
             cap.release()
-            self._run = False
             self.status.emit("камера не открылась")
-            self.active.emit(False)
-            return
+            return None
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.cfg.get("camera_width", 640)))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.cfg.get("camera_height", 480)))
+        # Запрошенное разрешение — пожелание, а не требование: часть камер
+        # на нём падает. Не вышло — снимаем в том, что даёт драйвер.
+        for prop, key, default in ((cv2.CAP_PROP_FRAME_WIDTH, "camera_width", 640),
+                                   (cv2.CAP_PROP_FRAME_HEIGHT, "camera_height", 480)):
+            try:
+                cap.set(prop, int(self.cfg.get(key, default)))
+            except Exception:                        # noqa: BLE001
+                pass
+        return cap
+
+    def _loop(self, cap):
         self.active.emit(True)
         self.status.emit("вижу")
-
         preview_w = int(self.cfg.get("camera_preview_width", 160))
+        misses = 0
         while self._run:
             ok, frame = cap.read()
             if not ok or frame is None:
+                misses += 1
+                if misses > 50:                      # ~10 секунд пустоты — камеру забрали
+                    self.status.emit("камера пропала")
+                    return
                 time.sleep(0.2)
                 continue
+            misses = 0
             with self._lock:
                 self._last = frame
             if not self._idle:
@@ -130,9 +172,6 @@ class Eyes(QObject):
                 if small:
                     self.frame.emit(small)
             time.sleep(1.0 / (IDLE_FPS if self._idle else FPS))
-
-        cap.release()
-        self.active.emit(False)
 
     @staticmethod
     def _encode(frame, width, quality):

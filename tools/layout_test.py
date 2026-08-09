@@ -43,7 +43,7 @@ def main():
     app = QApplication(sys.argv)
     cfg = load_config()
     win = MainWindow(cfg, os.path.join(ROOT, "assets", "sprites"))
-    win.resize(int(cfg.get("window_width", 368)), int(cfg.get("window_height", 704)))
+    win.resize(int(cfg.get("window_width", 552)), int(cfg.get("window_height", 704)))
     win.show()
     app.processEvents()
 
