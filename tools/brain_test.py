@@ -38,22 +38,40 @@ class FakeResp:
         return iter(self._lines)
 
 
-def c_stream_openai():
-    """Форма openai: choices[].delta.content."""
-    lines = ["data: " + json.dumps({"choices": [{"delta": {"content": p}}]})
-             for p in ("[done] ", "Привет. ", "Как дела?")]
+def c_stream_responses():
+    """Рабочая форма: Responses API, строки event: пропускаем."""
+    lines = []
+    for p in ("[done] ", "Привет. ", "Как дела?"):
+        lines.append("event: response.output_text.delta")
+        lines.append("data: " + json.dumps(
+            {"type": "response.output_text.delta", "delta": p}))
     lines.append("data: [DONE]")
-    got = "".join(LlamaRunner._stream(FakeResp(lines)))
+    got = "".join(t for k, t in LlamaRunner._stream(FakeResp(lines)) if k == "text")
     if got != "[done] Привет. Как дела?":
         raise RuntimeError(f"собралось не то: {got!r}")
     return got
 
 
-def c_stream_native():
-    """Родная форма llama: event.delta.text."""
-    lines = [json.dumps({"event": {"delta": {"text": p}}})
+def c_stream_search():
+    """Вызов поиска должен доходить отдельным событием — иначе он невидим."""
+    lines = ["event: response.output_item.added",
+             "data: " + json.dumps({
+                 "type": "response.output_item.added",
+                 "item": {"type": "web_search_call",
+                          "action": {"type": "search", "query": "погода Бишкек"}}}),
+             "data: " + json.dumps({"type": "response.output_text.delta",
+                                    "delta": "[done] Жарко."})]
+    got = list(LlamaRunner._stream(FakeResp(lines)))
+    if ("search", "погода Бишкек") not in got:
+        raise RuntimeError(f"поиск не замечен: {got}")
+    return "запрос виден в ленте"
+
+
+def c_stream_openai():
+    """Старая форма chat/completions — на случай отката адреса в конфиге."""
+    lines = ["data: " + json.dumps({"choices": [{"delta": {"content": p}}]})
              for p in ("[think] ", "Думаю.")]
-    got = "".join(LlamaRunner._stream(FakeResp(lines)))
+    got = "".join(t for k, t in LlamaRunner._stream(FakeResp(lines)) if k == "text")
     if got != "[think] Думаю.":
         raise RuntimeError(f"собралось не то: {got!r}")
     return got
@@ -179,8 +197,9 @@ def c_sessions():
 
 
 print("── переключение мозга ──")
-check("поток, форма openai", c_stream_openai)
-check("поток, форма llama", c_stream_native)
+check("поток Responses API", c_stream_responses)
+check("вызов поиска в потоке", c_stream_search)
+check("поток, старая форма", c_stream_openai)
 check("озвучка предложениями", c_flush)
 check("без ключа не врёт", c_no_key)
 check("интерфейс совпадает с claude", c_same_interface)

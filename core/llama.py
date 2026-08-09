@@ -41,7 +41,7 @@ STORE = os.path.join(ROOT, "llama_sessions")
 # Старый Llama API (api.llama.com) Meta закрыла 6 июля 2026 — на любой ключ он
 # отвечает 401 «Authentication Error», и это легко принять за плохой ключ.
 # Живой адрес — Meta Model API, модели семейства muse-spark.
-DEFAULT_URL = "https://api.meta.ai/v1/chat/completions"
+DEFAULT_URL = "https://api.meta.ai/v1"
 DEFAULT_MODEL = "muse-spark-1.2"
 
 # Приписка своя, а не claude-овская: там половина про инструменты и поиск,
@@ -66,9 +66,13 @@ SYSTEM = (
     "выключили. Кадры выше в разговоре устарели, пересказывать их как «вижу прямо "
     "сейчас» нельзя. Спросят, видишь ли ты, — отвечай, что глаза выключены и их "
     "надо включить кнопкой ГЛАЗА. "
-    "ЧЕГО ТЫ НЕ УМЕЕШЬ: у тебя нет доступа к файлам, коду, командам и интернету. "
-    "Если просят что-то сделать на компьютере или найти свежее — честно скажи, "
-    "что для этого нужно переключить мозг на Клода кнопкой внизу."
+    "У ТЕБЯ ЕСТЬ ПОИСК В ИНТЕРНЕТЕ: если спрашивают про новости, курсы, погоду, "
+    "цены или что-то свежее — ищи, а не отвечай «не знаю» и не пересказывай "
+    "память. Назови источник коротко. Перед поиском скажи одну короткую фразу с "
+    "тегом — «[think] Сейчас посмотрю», — чтобы человек не сидел в тишине. "
+    "ЧЕГО ТЫ НЕ УМЕЕШЬ: у тебя нет доступа к файлам на компьютере, к коду и к "
+    "командам. Если просят что-то сделать на компьютере — честно скажи, что для "
+    "этого нужно переключить мозг на Клода кнопкой внизу."
 )
 
 REMINDER = ("\n\n[оболочка] Ответь одной-двумя фразами живой речью, без markdown. "
@@ -83,14 +87,19 @@ SENTENCE_END = re.compile(r"[.!?…](?=\s|$)")
 
 def endpoint(cfg):
     """
-    Полный адрес запроса. В документации адрес дают то целиком, то базой
-    (`https://api.llama.com/compat/v1`) — принимаем оба, иначе POST уходит
-    мимо и сервер отвечает не пойми чем.
+    Адрес запроса. В конфиге можно писать как базу (`https://api.meta.ai/v1`),
+    так и полный путь — приводим к одному виду, иначе POST уходит мимо.
+
+    Работаем через Responses API, а не Chat Completions: встроенный поиск в
+    интернете есть только там. На chat/completions запрос уходит, но `tools`
+    с web_search там не поддерживается, и она отвечает по памяти.
     """
     url = (cfg.get("llama_api_url") or DEFAULT_URL).strip().rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url += "/chat/completions"
-    return url
+    for tail in ("/chat/completions", "/responses"):
+        if url.endswith(tail):
+            url = url[: -len(tail)]
+            break
+    return url + "/responses"
 
 
 def api_key(cfg):
@@ -266,44 +275,50 @@ class LlamaRunner(QObject):
         finally:
             self._set_busy(False)
 
+    def _content(self, text, image):
+        """Реплика человека в формате Responses API."""
+        if not image:
+            return text
+        return [
+            {"type": "input_text", "text": text},
+            # именно плоской строкой: вложенный {"url": …} этот API не принимает
+            {"type": "input_image",
+             "image_url": "data:image/jpeg;base64,"
+                          + base64.b64encode(image).decode()},
+        ]
+
     def _ask(self, text, image):
         import requests
 
-        body = text + REMINDER
-        if image:
-            content = [
-                {"type": "text", "text": body},
-                {"type": "image_url", "image_url": {
-                    "url": "data:image/jpeg;base64,"
-                           + base64.b64encode(image).decode()}},
-            ]
-        else:
-            content = body
-
-        messages = ([{"role": "system", "content": SYSTEM}]
-                    + self.history[-HISTORY_TURNS:]
-                    + [{"role": "user", "content": content}])
-
-        url = endpoint(self.cfg)
-        # Лимит щедрый не от жадности: muse-spark сначала думает, и размышления
-        # идут из того же бюджета. Замер на фразе «как дела?» — 405 токенов
-        # размышлений и 16 на сам ответ; при лимите 400 текста не остаётся вовсе,
-        # приходит пустой content и молчание в ответ.
-        payload = {"model": self.cfg.get("llama_model") or DEFAULT_MODEL,
-                   "messages": messages, "stream": True,
-                   "max_completion_tokens": int(self.cfg.get("llama_max_tokens")
-                                                or MAX_TOKENS)}
+        payload = {
+            "model": self.cfg.get("llama_model") or DEFAULT_MODEL,
+            "instructions": SYSTEM,
+            "input": self.history[-HISTORY_TURNS:] + [
+                {"role": "user", "content": self._content(text + REMINDER, image)}],
+            "stream": True,
+            # Лимит щедрый не от жадности: muse-spark сначала думает, и
+            # размышления идут из того же бюджета. При 400 текста не остаётся
+            # вовсе — приходит пустой ответ и молчание.
+            "max_output_tokens": int(self.cfg.get("llama_max_tokens")
+                                     or MAX_TOKENS),
+        }
         # Платим в основном за размышления, а не за ответ. Замер на «как дела?»
         # (tools/llama_cost.py): без настройки 421 токен на выходе, low — 354,
         # minimal — 101, и ответ во всех случаях один и тот же. Значение "none"
         # модель не принимает.
         effort = self.cfg.get("llama_reasoning_effort", EFFORT)
         if effort:
-            payload["reasoning_effort"] = effort
+            payload["reasoning"] = {"effort": effort}
+        # Поиск встроенный: ищет сама Meta, своего поисковика подключать не надо.
+        # Считается отдельно от токенов — $2.50 за 1000 запросов, и только если
+        # модель решит искать.
+        if self.cfg.get("llama_web_search", True):
+            payload["tools"] = [{"type": "web_search"}]
+
         headers = {"Authorization": f"Bearer {api_key(self.cfg)}",
                    "Content-Type": "application/json"}
 
-        resp = requests.post(url, headers=headers, json=payload,
+        resp = requests.post(endpoint(self.cfg), headers=headers, json=payload,
                              stream=True, timeout=(10, 180))
         if resp.status_code >= 400:
             raise RuntimeError(self._explain(resp))
@@ -312,10 +327,13 @@ class LlamaRunner(QObject):
         resp.encoding = "utf-8"
 
         said, buf, emo = "", "", None
-        for piece in self._stream(resp):
+        for kind, piece in self._stream(resp):
             if self._stop.is_set():
                 resp.close()
                 return
+            if kind == "search":
+                self.log.emit("tool", f"гуглю: {piece}")
+                continue
             buf += piece
             emo, said = self._flush(buf, said, emo, final=False)
         self._flush(buf, said, emo, final=True)
@@ -343,14 +361,28 @@ class LlamaRunner(QObject):
     @staticmethod
     def _stream(resp):
         """
-        Куски текста из потока. Разбираем две формы: openai-совместимую
-        (choices[].delta.content) и родную llama (event.delta.text) — какая
-        придёт, заранее не известно.
+        Разбор потока событий. Отдаёт пары («что это», «текст»):
+
+            ("text",   кусок ответа)
+            ("search", запрос, который она набрала в поиске)
+
+        Поток идёт в двух строках на событие: `event: имя` и `data: {json}`.
+        Первую пропускаем — имя события дублируется полем type внутри json.
+
+        Ответ приходит двумя сообщениями: сначала короткое «сейчас посмотрю»
+        (phase=commentary), потом найденное. Нам это на руку — человек слышит
+        голос сразу, а не сидит в тишине, пока идёт поиск.
+
+        На всякий случай понимаем и старую openai-совместимую форму: если
+        адрес в конфиге перевести обратно на chat/completions, разбор не
+        развалится.
         """
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:
                 continue
             line = raw.strip()
+            if line.startswith("event:"):
+                continue
             if line.startswith("data:"):
                 line = line[5:].strip()
             if not line or line == "[DONE]":
@@ -360,16 +392,25 @@ class LlamaRunner(QObject):
             except json.JSONDecodeError:
                 continue
 
-            for choice in ev.get("choices") or []:
+            kind = ev.get("type") or ""
+            if kind == "response.output_text.delta":
+                piece = ev.get("delta")
+                if isinstance(piece, str) and piece:
+                    yield "text", piece
+                continue
+            if kind == "response.output_item.added":
+                item = ev.get("item") or {}
+                if item.get("type") == "web_search_call":
+                    query = (item.get("action") or {}).get("query")
+                    if query:
+                        yield "search", query
+                continue
+
+            for choice in ev.get("choices") or []:      # старая форма
                 piece = ((choice.get("delta") or {}).get("content")
                          or (choice.get("message") or {}).get("content") or "")
                 if isinstance(piece, str) and piece:
-                    yield piece
-
-            inner = ev.get("event") or {}
-            piece = (inner.get("delta") or {}).get("text") or ""
-            if piece:
-                yield piece
+                    yield "text", piece
 
     def _flush(self, buf, said, emo, final):
         """
