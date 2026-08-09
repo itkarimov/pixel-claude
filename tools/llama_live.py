@@ -33,7 +33,7 @@ def main():
         return 1
 
     app = QCoreApplication(sys.argv)
-    brain = LlamaRunner(cfg)
+    brain = LlamaRunner(cfg, remember=False)   # проверка не должна плодить сессии
     seen = {"said": [], "emotions": [], "errors": [], "first": None,
             "t0": time.perf_counter()}
 

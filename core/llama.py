@@ -178,9 +178,13 @@ class LlamaRunner(QObject):
     session = Signal(str)
     ready = Signal(bool)
 
-    def __init__(self, cfg, parent=None):
+    def __init__(self, cfg, parent=None, remember=True):
         super().__init__(parent)
         self.cfg = cfg
+        # remember=False — для проверок: иначе каждый прогон tools/llama_live.py
+        # оставляет в списке разговор «Скажи одной фразой…», и человек их потом
+        # выгребает руками
+        self.remember = remember
         self.session_id = None
         self.workdir = cfg.get("workdir") or None
         self.history = []        # [{"role": ..., "content": ...}]
@@ -419,7 +423,7 @@ class LlamaRunner(QObject):
             return []
 
     def _save(self):
-        if not self.session_id:
+        if not self.session_id or not self.remember:
             return
         try:
             os.makedirs(STORE, exist_ok=True)
