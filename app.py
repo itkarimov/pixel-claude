@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (QApplication, QMenu,     # noqa: E402
 from core import sessions                               # noqa: E402
 from core.agent import AgentRunner                      # noqa: E402
 from core.confirm import Confirmer                      # noqa: E402
+from core.llama import LlamaRunner                      # noqa: E402
 from core.stt import Listener                           # noqa: E402
 from core.tts import Speaker                            # noqa: E402
 from core.vision import Eyes                            # noqa: E402
@@ -143,7 +144,11 @@ class Shell(QObject):
         super().__init__()
         self.cfg = cfg
         self.win = MainWindow(cfg, os.path.join(ROOT, "assets", "sprites"))
+        # Оба мозга живут рядом. Claude — процесс, его держим поднятым; Meta AI —
+        # просто http, ничего не занимает. Переключение кнопкой, без перезапуска.
         self.agent = AgentRunner(cfg)
+        self.llama = LlamaRunner(cfg)
+        self.backend = "claude"
         self.speaker = Speaker(cfg)
         self.listener = Listener(cfg)
         self.eyes = Eyes(cfg)
@@ -163,6 +168,39 @@ class Shell(QObject):
         self.agent.start()
         # то же и для голоса: первое соединение с синтезом стоит лишние 1.7 с
         self.speaker.warmup()
+
+    # ── мозг ──────────────────────────────────────────────────────────────
+    @property
+    def brain(self):
+        """Тот мозг, что сейчас отвечает."""
+        return self.llama if self.backend == "llama" else self.agent
+
+    def on_brain_switched(self, name):
+        if name == self.backend:
+            return
+        if name == "llama" and not self.llama.available():
+            # молча оставить кнопку нажатой — обман: ответов не будет
+            self.win.chat.append(
+                "error", "нет ключа Meta AI. Впиши llama_api_key в config.json "
+                         "или задай LLAMA_API_KEY — ключ дают на "
+                         "llama.developer.meta.com")
+            self.win.chat.set_brain("claude")
+            return
+        self.speaker.shutup()
+        self.backend = name
+        self.win.chat.set_brain(name)
+        if name == "llama":
+            self.llama.start()
+            self.win.chat.append("system", "мозг: Meta AI · "
+                                           + (self.cfg.get("llama_model")
+                                              or "Llama"))
+            self.win.chat.append("system", "инструментов нет — файлы, команды "
+                                           "и поиск только у Клода")
+        else:
+            self.win.chat.append("system", "мозг: Claude")
+            if not self.agent.alive():
+                self.agent.start()
+        self.win.chat.set_sessions(self.items, self.brain.session_id)
 
     # ── трей ──────────────────────────────────────────────────────────────
     def _tray(self):
@@ -211,6 +249,7 @@ class Shell(QObject):
         self.watcher.stop()
         self.eyes.stop()
         self.agent.stop()
+        self.llama.stop()
         if self.tray:
             self.tray.hide()
         QApplication.quit()
@@ -224,14 +263,17 @@ class Shell(QObject):
         w.chat.session_picked.connect(self.on_session_picked)
         w.chat.session_new.connect(self.on_session_new)
         w.chat.sessions_needed.connect(self.on_sessions_needed)
+        w.chat.brain_switched.connect(self.on_brain_switched)
         self.tail_loaded.connect(self.on_tail)
         self.list_loaded.connect(self.on_list)
 
-        self.agent.log.connect(w.chat.append)
-        self.agent.log.connect(self._note_prompt)
-        self.agent.emotion.connect(w.portrait.set_emotion)
-        self.agent.speak.connect(self.speaker.say)
-        self.agent.busy.connect(self.on_busy)
+        # оба мозга говорят в одни и те же уши: лента, портрет, голос
+        for brain in (self.agent, self.llama):
+            brain.log.connect(w.chat.append)
+            brain.log.connect(self._note_prompt)
+            brain.emotion.connect(w.portrait.set_emotion)
+            brain.speak.connect(self.speaker.say)
+            brain.busy.connect(self.on_busy)
         self.agent.session.connect(self.on_session_created)
 
         self.listener.heard.connect(self.on_heard)
@@ -295,7 +337,7 @@ class Shell(QObject):
 
     def on_list(self, items):
         self.items = items
-        self.win.chat.set_sessions(self.items, self.agent.session_id)
+        self.win.chat.set_sessions(self.items, self.brain.session_id)
         self.win.chat.set_status("готова")
 
     def _find(self, session_id):
@@ -312,7 +354,7 @@ class Shell(QObject):
         threading.Thread(target=work, daemon=True).start()
 
     def on_tail(self, session_id, rows):
-        if session_id != self.agent.session_id:
+        if session_id != self.brain.session_id:
             return                               # пока читали, сессию переключили
         for kind, text in rows:
             self.win.chat.append(kind, text)
@@ -324,6 +366,11 @@ class Shell(QObject):
         self.speaker.shutup()
         self.eyes.forget()
         self.watcher.forget()          # в чужом контексте кадра ещё не видели
+        if self.backend != "claude":
+            # список — это сайдбар приложения Claude, чужие сессии Meta AI
+            # не откроет: выбор сессии сам возвращает на Клода
+            self.backend = "claude"
+            self.win.chat.set_brain("claude")
         self.agent.set_session(item["id"], item["cwd"])
         self.win.chat.clear()
         folder = os.path.basename((item["cwd"] or "").rstrip("\\/"))
@@ -336,8 +383,8 @@ class Shell(QObject):
         self.speaker.shutup()
         self.eyes.forget()
         self.watcher.forget()
-        self.agent.reset()
-        self.agent.workdir = self.cfg["workdir"]     # новая — в папке из конфига
+        self.brain.reset()
+        self.brain.workdir = self.cfg["workdir"]     # новая — в папке из конфига
         self.win.chat.clear()
         self.win.chat.append("system", "новая сессия — говори")
         self.win.portrait.set_emotion("neutral")
@@ -418,14 +465,18 @@ class Shell(QObject):
 
     # ── просьбы и подтверждение ───────────────────────────────────────────
     def _run(self, text):
-        """Отдать просьбу агенту как есть."""
+        """Отдать просьбу активному мозгу как есть."""
         self.speaker.shutup()
         body, shot = self._compose(text)
-        self.agent.send(body, shot, display=text)
+        self.brain.send(body, shot, display=text)
 
     def _offer(self, text, spoken):
         """Опасную просьбу придерживаем и переспрашиваем, остальные — сразу."""
-        if self.confirmer.needs(text, spoken):
+        if self.backend == "llama":
+            # переспрашивать не о чем: у Meta AI нет инструментов, удалять и
+            # коммитить ей нечем — любая просьба остаётся просто разговором
+            self._run(text)
+        elif self.confirmer.needs(text, spoken):
             self.confirmer.hold(text)
         else:
             self._run(text)

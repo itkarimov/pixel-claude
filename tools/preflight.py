@@ -56,6 +56,22 @@ def c_claude():
     return os.path.basename(agent.claude)
 
 
+def c_llama():
+    """Второй мозг — проверяем только ключ, запрос стоит денег."""
+    from app import load_config
+    from core.llama import api_key, DEFAULT_MODEL
+    cfg = load_config()
+    if not api_key(cfg):
+        raise RuntimeError("нет ключа Meta AI — впиши llama_api_key в config.json "
+                           "или задай LLAMA_API_KEY. Ключ: "
+                           "https://llama.developer.meta.com")
+    try:
+        import requests                             # noqa: F401
+    except ImportError:
+        raise RuntimeError("нет requests — pip install requests")
+    return f"ключ на месте, модель «{cfg.get('llama_model') or DEFAULT_MODEL}»"
+
+
 def c_sessions():
     from core import sessions
     t0 = time.time()
@@ -105,6 +121,7 @@ print("── предполётная проверка ──")
 check("модули", c_imports)
 check("спрайты эмоций", c_sprites)
 check("claude CLI", c_claude)
+check("Meta AI (второй мозг)", c_llama)
 check("список сессий", c_sessions)
 check("синтез речи", c_tts)
 check("микрофон", c_mic)

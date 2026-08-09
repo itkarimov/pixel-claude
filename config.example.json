@@ -9,6 +9,11 @@
   "allowed_tools": ["WebSearch", "WebFetch"],
   "disable_mcp": true,
 
+  "_второй_мозг": "Кнопка МОЗГ внизу ленты переключает на Meta AI (Llama). Ключ можно не писать сюда, а задать переменной окружения LLAMA_API_KEY или META_API_KEY. Получить: https://llama.developer.meta.com. У Meta AI нет инструментов — ни файлов, ни команд, ни поиска.",
+  "llama_api_key": "",
+  "llama_model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+  "llama_api_url": "https://api.llama.com/v1/chat/completions",
+
   "_скорость": "hooks_mode: skip_user — не грузить пользовательские настройки, где лежат хуки (они стоят 3.7 с на реплику). safe — вообще без надстроек, включая CLAUDE.md. keep — как обычно, медленно.",
   "hooks_mode": "skip_user",
   "stream_partial": true,

@@ -321,6 +321,7 @@ class Chat(QWidget):
     session_picked = Signal(str)      # выбрана сессия из списка
     session_new = Signal()            # начать с чистого листа
     sessions_needed = Signal()        # открывают список — перечитай реестр
+    brain_switched = Signal(str)      # "claude" | "llama"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -369,6 +370,16 @@ class Chat(QWidget):
             f"font-family:Consolas; font-size:12px; }}")
         self.input.returnPressed.connect(self._submit)
 
+        # Переключатель мозга. Он же и подпись: видно, кто сейчас отвечает —
+        # иначе по ответам не отличишь, а платят они из разных карманов.
+        self.brain = QPushButton("МОЗГ: CLAUDE")
+        self.brain.setCheckable(True)
+        self.brain.setFixedHeight(26)
+        self.brain.setCursor(Qt.PointingHandCursor)
+        self.brain.setToolTip("переключить на Meta AI (Llama)")
+        self._style_brain(False)
+        self.brain.toggled.connect(self._brain_switched)
+
         self.status = QLabel("готова")
         self.status.setStyleSheet(
             f"color:{GREY}; font-family:Consolas; font-size:11px; padding:2px 6px;")
@@ -381,12 +392,18 @@ class Chat(QWidget):
         top.addWidget(self.picker, 1)
         top.addWidget(self.btn_new, 0)
 
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        bottom.addWidget(self.brain, 0)
+        bottom.addStretch(1)
+        bottom.addWidget(self.status, 0)
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 4, 10, 10)
         lay.setSpacing(5)
         lay.addLayout(top)
         lay.addWidget(self.view, 1)
-        lay.addWidget(self.status, 0, Qt.AlignRight)
+        lay.addLayout(bottom)
         lay.addWidget(self.confirm, 0)
         lay.addWidget(self.input, 0)
 
@@ -405,6 +422,32 @@ class Chat(QWidget):
             idx = 1
         self.picker.setCurrentIndex(idx if idx >= 0 else 0)
         self.picker.blockSignals(False)
+
+    # ── переключатель мозга ───────────────────────────────────────────────
+    def _style_brain(self, llama):
+        color, border = ("#8ab4ff", "#2f4d7d") if llama else (GREEN, "#2f7d55")
+        self.brain.setStyleSheet(f"""
+            QPushButton {{
+                background:{PANEL}; color:{color}; border:3px solid {border};
+                padding:2px 10px; font-family:Consolas; font-size:11px;
+                font-weight:bold; letter-spacing:1px;
+            }}
+            QPushButton:hover {{ background:#292244; }}
+        """)
+
+    def _brain_switched(self, llama):
+        self.brain.setText("МОЗГ: META AI" if llama else "МОЗГ: CLAUDE")
+        self._style_brain(llama)
+        self.brain_switched.emit("llama" if llama else "claude")
+
+    def set_brain(self, name):
+        """Поставить переключатель без сигнала — при запуске и при откате."""
+        llama = name == "llama"
+        self.brain.blockSignals(True)
+        self.brain.setChecked(llama)
+        self.brain.setText("МОЗГ: META AI" if llama else "МОЗГ: CLAUDE")
+        self._style_brain(llama)
+        self.brain.blockSignals(False)
 
     def _picked(self, index):
         sid = self.picker.itemData(index)
