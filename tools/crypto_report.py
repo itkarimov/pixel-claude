@@ -28,7 +28,8 @@ REMOTE = (
     "tail -n 15 ~/trader/cron.log 2>/dev/null; "
     "echo; echo '=== trade_log.txt, последние 15 строк ==='; "
     "tail -n 15 ~/trader/trade_log.txt 2>/dev/null; "
-    "echo; echo '=== время на сервере ==='; date"
+    # часы бота бишкекские, сервер Beget живёт по Москве — показываем Бишкек
+    "echo; echo '=== время на сервере ==='; TZ=Asia/Bishkek date"
 )
 
 
