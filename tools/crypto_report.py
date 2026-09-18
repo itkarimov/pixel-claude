@@ -11,7 +11,7 @@ acceptEdits — то есть подтверждать никто не буде�
 Читает три вещи (мастер-состояние живёт на сервере, локальные файлы устарели):
     ~/trader/positions.json   позиции
     ~/trader/cron.log         жив ли крон механики
-    ~/trader/trade_log.txt    последние сделки
+    ~/trader/trade_log.log    последние сделки
 
 Ничего не пишет и не отправляет ордера.
 
@@ -26,8 +26,8 @@ REMOTE = (
     "echo '=== positions.json ==='; cat ~/trader/positions.json 2>/dev/null; "
     "echo; echo '=== cron.log, последние 15 строк ==='; "
     "tail -n 15 ~/trader/cron.log 2>/dev/null; "
-    "echo; echo '=== trade_log.txt, последние 15 строк ==='; "
-    "tail -n 15 ~/trader/trade_log.txt 2>/dev/null; "
+    "echo; echo '=== trade_log.log, последние 15 строк ==='; "
+    "tail -n 15 ~/trader/trade_log.log 2>/dev/null; "
     # часы бота бишкекские, сервер Beget живёт по Москве — показываем Бишкек
     "echo; echo '=== время на сервере ==='; TZ=Asia/Bishkek date"
 )
