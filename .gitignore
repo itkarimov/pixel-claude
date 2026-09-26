@@ -3,8 +3,9 @@ state.json
 mine.json
 crash.log
 
-# переписка со вторым мозгом (Meta AI) — контекст держим сами
+# переписка с мозгами по API (Meta AI, Groq) — контекст держим сами
 llama_sessions/
+groq_sessions/
 
 # промежуточное: все 40 клеток листа, пересобираются из ref.png
 assets/sheet/

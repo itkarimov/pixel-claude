@@ -46,7 +46,11 @@ DEFAULT_MODEL = "muse-spark-1.2"
 
 # Приписка своя, а не claude-овская: там половина про инструменты и поиск,
 # которых здесь нет, и обещать их — значит врать голосом.
-SYSTEM = (
+#
+# Разбита на куски, потому что мозгов на этой механике теперь два: у Meta есть
+# встроенный поиск, у Groq его нет, а всё остальное — характер, женский род,
+# теги эмоций, честность про камеру — у них общее.
+PERSONA = (
     "Ты — девушка, голосовая помощница в пиксельной оболочке, твой ответ "
     "озвучивается вслух женским голосом. "
     "ПРАВИЛА ОТВЕТА: "
@@ -66,14 +70,22 @@ SYSTEM = (
     "выключили. Кадры выше в разговоре устарели, пересказывать их как «вижу прямо "
     "сейчас» нельзя. Спросят, видишь ли ты, — отвечай, что глаза выключены и их "
     "надо включить кнопкой ГЛАЗА. "
+)
+
+SEARCH = (
     "У ТЕБЯ ЕСТЬ ПОИСК В ИНТЕРНЕТЕ: если спрашивают про новости, курсы, погоду, "
     "цены или что-то свежее — ищи, а не отвечай «не знаю» и не пересказывай "
     "память. Назови источник коротко. Перед поиском скажи одну короткую фразу с "
     "тегом — «[think] Сейчас посмотрю», — чтобы человек не сидел в тишине. "
+)
+
+NO_TOOLS = (
     "ЧЕГО ТЫ НЕ УМЕЕШЬ: у тебя нет доступа к файлам на компьютере, к коду и к "
     "командам. Если просят что-то сделать на компьютере — честно скажи, что для "
     "этого нужно переключить мозг на Клода кнопкой внизу."
 )
+
+SYSTEM = PERSONA + SEARCH + NO_TOOLS
 
 REMINDER = ("\n\n[оболочка] Ответь одной-двумя фразами живой речью, без markdown. "
             "О себе — в женском роде. Первым символом — тег эмоции, один из: "
@@ -108,7 +120,7 @@ def api_key(cfg):
             or os.environ.get("META_API_KEY") or "").strip()
 
 
-def list_sessions(limit=40):
+def list_sessions(limit=40, store=STORE, brain="llama", mark="Meta AI"):
     """
     Разговоры с Meta AI, свежие сверху — в том же виде, что и сессии claude,
     чтобы выпадающий список ничего не различал.
@@ -116,17 +128,20 @@ def list_sessions(limit=40):
     Показываем только то, что оболочка вела сама через API. Переписку с сайта
     meta.ai сюда не подтянуть: это другой продукт, и доступа к его истории у
     api.llama.com нет.
+
+    Groq хранит свои разговоры так же, только в другой папке, поэтому папка и
+    подпись — параметры, а не константы.
     """
     out = []
     try:
-        names = os.listdir(STORE)
+        names = os.listdir(store)
     except OSError:
         return out
 
     for name in names:
         if not name.endswith(".json"):
             continue
-        path = os.path.join(STORE, name)
+        path = os.path.join(store, name)
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -139,8 +154,8 @@ def list_sessions(limit=40):
             "title": title,
             "cwd": "",
             "named": True,
-            "brain": "llama",
-            "label": f"{title} · Meta AI",
+            "brain": brain,
+            "label": f"{title} · {mark}",
             "mtime": data.get("at") or os.path.getmtime(path),
         })
     out.sort(key=lambda it: it["mtime"], reverse=True)
@@ -182,7 +197,13 @@ def tail(path, limit=10):
 
 
 class LlamaRunner(QObject):
-    """Мозг Meta AI. Сигналы и методы — как у AgentRunner."""
+    """
+    Мозг Meta AI. Сигналы и методы — как у AgentRunner.
+
+    От него же наследуется мозг Groq (core/groq.py): разговор, история, разбор
+    потока и озвучка у них общие, разное — адрес, ключ, папка и тело запроса.
+    Всё это вынесено в атрибуты класса и четыре коротких метода ниже.
+    """
 
     log = Signal(str, str)      # (вид, текст): user | assistant | tool | system | error
     speak = Signal(str)
@@ -190,6 +211,12 @@ class LlamaRunner(QObject):
     busy = Signal(bool)
     session = Signal(str)
     ready = Signal(bool)
+
+    brand = "Meta AI"                       # как называем в сообщениях
+    store = STORE                           # где лежат разговоры
+    system = SYSTEM                         # приписка про характер и правила
+    key_hint = ("впиши llama_api_key в config.json или задай LLAMA_API_KEY — "
+                "ключ дают на llama.developer.meta.com")
 
     def __init__(self, cfg, parent=None, remember=True):
         super().__init__(parent)
@@ -204,17 +231,23 @@ class LlamaRunner(QObject):
         self._busy = False
         self._stop = threading.Event()
 
+    # ── что у мозгов разное ───────────────────────────────────────────────
+    def _key(self):
+        return api_key(self.cfg)
+
+    def _endpoint(self):
+        return endpoint(self.cfg)
+
     # ── публичное API ─────────────────────────────────────────────────────
     def available(self):
-        return bool(api_key(self.cfg))
+        return bool(self._key())
 
     def alive(self):
         return self.available()
 
     def start(self):
         if not self.available():
-            self.log.emit("error", "нет ключа Meta AI — впиши llama_api_key "
-                                   "в config.json или задай LLAMA_API_KEY")
+            self.log.emit("error", f"нет ключа {self.brand} — {self.key_hint}")
             self.ready.emit(False)
             return
         if not self.session_id:
@@ -242,7 +275,7 @@ class LlamaRunner(QObject):
         self.session_id = None
         self.history = []
         self.restart()
-        self.log.emit("system", "новая сессия Meta AI — контекст пустой")
+        self.log.emit("system", f"новая сессия {self.brand} — контекст пустой")
 
     def send(self, text, image=None, display=None):
         text = (text or "").strip()
@@ -250,8 +283,7 @@ class LlamaRunner(QObject):
             return
         self.log.emit("user", (display or text).strip())
         if not self.available():
-            self.log.emit("error", "нет ключа Meta AI — получить можно на "
-                                   "llama.developer.meta.com")
+            self.log.emit("error", f"нет ключа {self.brand} — {self.key_hint}")
             self.emotion.emit("unhappy")
             return
         if self._busy:
@@ -271,7 +303,7 @@ class LlamaRunner(QObject):
             self._ask(text, image)
         except Exception as exc:                    # noqa: BLE001 — сеть роняет чем угодно
             self.emotion.emit("unhappy")
-            self.log.emit("error", f"Meta AI не ответила: {exc}")
+            self.log.emit("error", f"{self.brand} не ответила: {exc}")
         finally:
             self._set_busy(False)
 
@@ -287,12 +319,10 @@ class LlamaRunner(QObject):
                           + base64.b64encode(image).decode()},
         ]
 
-    def _ask(self, text, image):
-        import requests
-
+    def _payload(self, text, image):
         payload = {
             "model": self.cfg.get("llama_model") or DEFAULT_MODEL,
-            "instructions": SYSTEM,
+            "instructions": self.system,
             "input": self.history[-HISTORY_TURNS:] + [
                 {"role": "user", "content": self._content(text + REMINDER, image)}],
             "stream": True,
@@ -314,11 +344,16 @@ class LlamaRunner(QObject):
         # модель решит искать.
         if self.cfg.get("llama_web_search", True):
             payload["tools"] = [{"type": "web_search"}]
+        return payload
 
-        headers = {"Authorization": f"Bearer {api_key(self.cfg)}",
+    def _ask(self, text, image):
+        import requests
+
+        headers = {"Authorization": f"Bearer {self._key()}",
                    "Content-Type": "application/json"}
 
-        resp = requests.post(endpoint(self.cfg), headers=headers, json=payload,
+        resp = requests.post(self._endpoint(), headers=headers,
+                             json=self._payload(text, image),
                              stream=True, timeout=(10, 180))
         if resp.status_code >= 400:
             raise RuntimeError(self._explain(resp))
@@ -343,8 +378,7 @@ class LlamaRunner(QObject):
         self.history.append({"role": "assistant", "content": buf.strip()})
         self._save()
 
-    @staticmethod
-    def _explain(resp):
+    def _explain(self, resp):
         """Понятная причина вместо голого кода ответа."""
         detail = ""
         try:
@@ -355,7 +389,7 @@ class LlamaRunner(QObject):
         if resp.status_code in (401, 403):
             return f"ключ не принят ({resp.status_code}). {detail}".strip()
         if resp.status_code == 429:
-            return "лимит запросов Meta AI исчерпан"
+            return f"лимит запросов {self.brand} исчерпан"
         return f"ошибка {resp.status_code}. {detail}".strip()
 
     @staticmethod
@@ -455,7 +489,7 @@ class LlamaRunner(QObject):
         return _first_words({"messages": self.history})
 
     def _path(self, session_id):
-        return os.path.join(STORE, f"{session_id}.json")
+        return os.path.join(self.store, f"{session_id}.json")
 
     def _load(self, session_id):
         if not session_id:
@@ -471,7 +505,7 @@ class LlamaRunner(QObject):
         if not self.session_id or not self.remember:
             return
         try:
-            os.makedirs(STORE, exist_ok=True)
+            os.makedirs(self.store, exist_ok=True)
             with open(self._path(self.session_id), "w", encoding="utf-8") as fh:
                 json.dump({"id": self.session_id, "at": time.time(),
                            "title": self.title(), "messages": self.history},

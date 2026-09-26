@@ -57,7 +57,9 @@ from PySide6.QtWidgets import (QApplication, QMenu,     # noqa: E402
 from core import sessions                               # noqa: E402
 from core.agent import AgentRunner                      # noqa: E402
 from core.confirm import Confirmer                      # noqa: E402
+from core import groq                                   # noqa: E402
 from core import llama                                  # noqa: E402
+from core.groq import GroqRunner                        # noqa: E402
 from core.llama import LlamaRunner                      # noqa: E402
 from core.stt import Listener                           # noqa: E402
 from core.tts import Speaker                            # noqa: E402
@@ -147,10 +149,14 @@ class Shell(QObject):
         super().__init__()
         self.cfg = cfg
         self.win = MainWindow(cfg, os.path.join(ROOT, "assets", "sprites"))
-        # Оба мозга живут рядом. Claude — процесс, его держим поднятым; Meta AI —
-        # просто http, ничего не занимает. Переключение кнопкой, без перезапуска.
+        # Все мозги живут рядом. Claude — процесс, его держим поднятым;
+        # Meta AI и Groq — просто http, ничего не занимают. Переключение
+        # кнопкой, без перезапуска.
         self.agent = AgentRunner(cfg)
         self.llama = LlamaRunner(cfg)
+        self.groq = GroqRunner(cfg)
+        self.brains = {"claude": self.agent, "llama": self.llama,
+                       "groq": self.groq}
         self.backend = "claude"
         self.speaker = Speaker(cfg)
         self.listener = Listener(cfg)
@@ -176,33 +182,38 @@ class Shell(QObject):
     @property
     def brain(self):
         """Тот мозг, что сейчас отвечает."""
-        return self.llama if self.backend == "llama" else self.agent
+        return self.brains.get(self.backend, self.agent)
 
     def on_brain_switched(self, name):
         if name == self.backend:
             return
-        if name == "llama" and not self.llama.available():
-            # молча оставить кнопку нажатой — обман: ответов не будет
+        brain = self.brains.get(name)
+        if brain is None:
+            return
+        if not brain.available():
+            # молча оставить кнопку переключённой — обман: ответов не будет
+            # (у Клода brand нет: он не по ключу живёт, а по наличию CLI)
             self.win.chat.append(
-                "error", "нет ключа Meta AI. Впиши llama_api_key в config.json "
-                         "или задай LLAMA_API_KEY — ключ дают на "
-                         "llama.developer.meta.com")
-            self.win.chat.set_brain("claude")
+                "error", f"{getattr(brain, 'brand', 'claude')} недоступен. "
+                         + getattr(brain, "key_hint", "проверь PATH"))
+            self.win.chat.set_brain(self.backend)
             return
         self.speaker.shutup()
         self.backend = name
         self.win.chat.set_brain(name)
-        if name == "llama":
-            self.llama.start()
-            self.win.chat.append("system", "мозг: Meta AI · "
-                                           + (self.cfg.get("llama_model")
-                                              or "Llama"))
-            self.win.chat.append("system", "инструментов нет — файлы, команды "
-                                           "и поиск только у Клода")
-        else:
+        if name == "claude":
             self.win.chat.append("system", "мозг: Claude")
             if not self.agent.alive():
                 self.agent.start()
+        else:
+            brain.start()
+            model = self.cfg.get(f"{name}_model") or brain.brand
+            self.win.chat.append("system", f"мозг: {brain.brand} · {model}")
+            self.win.chat.append("system", "инструментов нет — файлы и команды "
+                                           "только у Клода")
+            if name == "groq":
+                self.win.chat.append("system", "и без интернета — поиск у "
+                                               "Meta AI и у Клода")
         self.on_list(self._collect_sessions())      # у каждого мозга свой список
 
     # ── трей ──────────────────────────────────────────────────────────────
@@ -251,8 +262,8 @@ class Shell(QObject):
         self.listener.stop()
         self.watcher.stop()
         self.eyes.stop()
-        self.agent.stop()
-        self.llama.stop()
+        for brain in self.brains.values():
+            brain.stop()
         if self.tray:
             self.tray.hide()
         QApplication.quit()
@@ -270,15 +281,17 @@ class Shell(QObject):
         self.tail_loaded.connect(self.on_tail)
         self.list_loaded.connect(self.on_list)
 
-        # оба мозга говорят в одни и те же уши: лента, портрет, голос
-        for brain in (self.agent, self.llama):
+        # все мозги говорят в одни и те же уши: лента, портрет, голос
+        for brain in self.brains.values():
             brain.log.connect(w.chat.append)
             brain.log.connect(self._note_prompt)
             brain.emotion.connect(w.portrait.set_emotion)
             brain.speak.connect(self.speaker.say)
             brain.busy.connect(self.on_busy)
         self.agent.session.connect(self.on_session_created)
-        self.llama.session.connect(self.on_llama_session)
+        for name in ("llama", "groq"):
+            self.brains[name].session.connect(
+                lambda sid, n=name: self.on_api_session(sid, n))
 
         self.listener.heard.connect(self.on_heard)
         self.listener.status.connect(w.chat.set_status)
@@ -338,11 +351,13 @@ class Shell(QObject):
     def _collect_sessions(self):
         """
         Список для того мозга, что сейчас отвечает. У каждого он свой и
-        смешивать их нельзя: у claude это сайдбар приложения, у Meta AI —
-        наши собственные разговоры в llama_sessions.
+        смешивать их нельзя: у claude это сайдбар приложения, у Meta AI и
+        Groq — наши собственные разговоры в llama_sessions и groq_sessions.
         """
         if self.backend == "llama":
             return llama.list_sessions(limit=60)
+        if self.backend == "groq":
+            return groq.list_sessions(limit=60)
         return sessions.list_sessions(limit=60)
 
     def _reload_sessions(self):
@@ -369,7 +384,7 @@ class Shell(QObject):
 
     def _load_tail(self, item):
         """Хвост читаем в потоке: файл активной сессии бывает на мегабайты."""
-        read = llama.tail if (item.get("brain") == "llama") else sessions.tail
+        read = llama.tail if item.get("brain") in ("llama", "groq") else sessions.tail
 
         def work():
             self.tail_loaded.emit(item["id"], read(item["path"]))
@@ -426,13 +441,14 @@ class Shell(QObject):
         save_state({**item, "session_id": session_id})
         self.win.chat.set_sessions(self.items, session_id)
 
-    def on_llama_session(self, session_id):
-        """Meta AI завела разговор — запоминаем, чтобы поднять его при запуске."""
-        save_state({"session_id": session_id, "cwd": "", "brain": "llama",
-                    "path": os.path.join(ROOT, "llama_sessions",
-                                         f"{session_id}.json"),
-                    "title": (self.last_prompt or "разговор с Meta AI")[:60]})
-        if self.backend == "llama":
+    def on_api_session(self, session_id, name):
+        """Meta AI или Groq завели разговор — запоминаем, чтобы поднять при запуске."""
+        brain = self.brains[name]
+        save_state({"session_id": session_id, "cwd": "", "brain": name,
+                    "path": os.path.join(brain.store, f"{session_id}.json"),
+                    "title": (self.last_prompt
+                              or f"разговор с {brain.brand}")[:60]})
+        if self.backend == name:
             self.win.chat.set_sessions(self.items, session_id)
 
     # ── события ───────────────────────────────────────────────────────────
@@ -506,9 +522,9 @@ class Shell(QObject):
 
     def _offer(self, text, spoken):
         """Опасную просьбу придерживаем и переспрашиваем, остальные — сразу."""
-        if self.backend == "llama":
-            # переспрашивать не о чем: у Meta AI нет инструментов, удалять и
-            # коммитить ей нечем — любая просьба остаётся просто разговором
+        if self.backend != "claude":
+            # переспрашивать не о чем: у мозгов по API нет инструментов,
+            # удалять и коммитить им нечем — любая просьба остаётся разговором
             self._run(text)
         elif self.confirmer.needs(text, spoken):
             self.confirmer.hold(text)

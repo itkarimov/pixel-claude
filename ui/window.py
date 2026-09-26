@@ -21,6 +21,15 @@ GREY = "#8b85a6"
 
 KIND_COLOR = {"user": CYAN, "assistant": INK, "tool": GREEN,
               "system": GREY, "error": RED}
+
+# Мозги в том порядке, в каком их перебирает кнопка. Цвет у каждого свой,
+# чтобы на портрете было видно, кто отвечает, не вчитываясь в подпись.
+BRAINS = ("claude", "llama", "groq")
+BRAIN_LABEL = {"claude": "МОЗГ: CLAUDE", "llama": "МОЗГ: META AI",
+               "groq": "МОЗГ: GROQ"}
+BRAIN_COLOR = {"claude": (GREEN, "#2f7d55"),
+               "llama": ("#8ab4ff", "#2f4d7d"),
+               "groq": ("#f5915c", "#7d4527")}
 KIND_MARK = {"user": "›", "assistant": "◆", "tool": "·",
              "system": "—", "error": "!"}
 
@@ -321,7 +330,7 @@ class Chat(QWidget):
     session_picked = Signal(str)      # выбрана сессия из списка
     session_new = Signal()            # начать с чистого листа
     sessions_needed = Signal()        # открывают список — перечитай реестр
-    brain_switched = Signal(str)      # "claude" | "llama"
+    brain_switched = Signal(str)      # "claude" | "llama" | "groq"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -372,13 +381,14 @@ class Chat(QWidget):
 
         # Переключатель мозга. Он же и подпись: видно, кто сейчас отвечает —
         # иначе по ответам не отличишь, а платят они из разных карманов.
-        self.brain = QPushButton("МОЗГ: CLAUDE")
-        self.brain.setCheckable(True)
+        # Мозгов трое, поэтому не переключатель, а кольцо: жмёшь — следующий.
+        self.brain_name = BRAINS[0]
+        self.brain = QPushButton(BRAIN_LABEL[self.brain_name])
         self.brain.setFixedHeight(26)
         self.brain.setCursor(Qt.PointingHandCursor)
-        self.brain.setToolTip("переключить на Meta AI (Llama)")
-        self._style_brain(False)
-        self.brain.toggled.connect(self._brain_switched)
+        self.brain.setToolTip("сменить мозг: Claude → Meta AI → Groq")
+        self._style_brain(self.brain_name)
+        self.brain.clicked.connect(self._brain_next)
 
         self.status = QLabel("готова")
         self.status.setStyleSheet(
@@ -424,8 +434,8 @@ class Chat(QWidget):
         self.picker.blockSignals(False)
 
     # ── переключатель мозга ───────────────────────────────────────────────
-    def _style_brain(self, llama):
-        color, border = ("#8ab4ff", "#2f4d7d") if llama else (GREEN, "#2f7d55")
+    def _style_brain(self, name):
+        color, border = BRAIN_COLOR.get(name, BRAIN_COLOR["claude"])
         self.brain.setStyleSheet(f"""
             QPushButton {{
                 background:{PANEL}; color:{color}; border:3px solid {border};
@@ -435,19 +445,19 @@ class Chat(QWidget):
             QPushButton:hover {{ background:#292244; }}
         """)
 
-    def _brain_switched(self, llama):
-        self.brain.setText("МОЗГ: META AI" if llama else "МОЗГ: CLAUDE")
-        self._style_brain(llama)
-        self.brain_switched.emit("llama" if llama else "claude")
+    def _brain_next(self):
+        """Следующий по кругу: Claude → Meta AI → Groq → Claude."""
+        nxt = BRAINS[(BRAINS.index(self.brain_name) + 1) % len(BRAINS)]
+        self.set_brain(nxt)
+        self.brain_switched.emit(nxt)
 
     def set_brain(self, name):
-        """Поставить переключатель без сигнала — при запуске и при откате."""
-        llama = name == "llama"
-        self.brain.blockSignals(True)
-        self.brain.setChecked(llama)
-        self.brain.setText("МОЗГ: META AI" if llama else "МОЗГ: CLAUDE")
-        self._style_brain(llama)
-        self.brain.blockSignals(False)
+        """Поставить кнопку без сигнала — при запуске и при откате."""
+        if name not in BRAIN_LABEL:
+            name = BRAINS[0]
+        self.brain_name = name
+        self.brain.setText(BRAIN_LABEL[name])
+        self._style_brain(name)
 
     def _picked(self, index):
         sid = self.picker.itemData(index)
