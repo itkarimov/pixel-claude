@@ -162,6 +162,24 @@ def list_sessions(limit=40, store=STORE, brain="llama", mark="Meta AI"):
     return out[:limit]
 
 
+def _tool_query(tool):
+    """
+    Что именно она набрала в поиске. У Groq аргументы лежат строкой json:
+    {"query": "погода Бишкек", "topn": 10, ...}.
+    """
+    if not isinstance(tool, dict):
+        return ""
+    args = tool.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return ""
+    if isinstance(args, dict):
+        return str(args.get("query") or "").strip()
+    return ""
+
+
 def _first_words(data):
     """Заголовок по первой реплике человека — своих названий у Meta AI нет."""
     for msg in data.get("messages") or []:
@@ -213,8 +231,8 @@ class LlamaRunner(QObject):
     ready = Signal(bool)
 
     brand = "Meta AI"                       # как называем в сообщениях
+    slug = "llama"                          # приставка ключей в config.json
     store = STORE                           # где лежат разговоры
-    system = SYSTEM                         # приписка про характер и правила
     key_hint = ("впиши llama_api_key в config.json или задай LLAMA_API_KEY — "
                 "ключ дают на llama.developer.meta.com")
 
@@ -232,11 +250,31 @@ class LlamaRunner(QObject):
         self._stop = threading.Event()
 
     # ── что у мозгов разное ───────────────────────────────────────────────
+    @property
+    def system(self):
+        return PERSONA + self._identity() + SEARCH + NO_TOOLS
+
+    def _identity(self):
+        """
+        Кем она себя называет. Без этой строки модель гадает: в приписке
+        упомянуты все три мозга, и Groq уверенно отвечал «я Meta AI».
+        """
+        model = self.cfg.get(f"{self.slug}_model") or self.brand
+        return (f"КТО ТЫ СЕЙЧАС: тобой думает {self.brand}, модель {model}. "
+                f"Спросят, какой у тебя мозг, — отвечай «{self.brand}» и не "
+                "гадай. Мозгов в оболочке три — Клод, Meta AI и Groq, — "
+                "человек переключает их кнопкой МОЗГ внизу окна. ")
+
     def _key(self):
         return api_key(self.cfg)
 
     def _endpoint(self):
         return endpoint(self.cfg)
+
+    @staticmethod
+    def _clean(text):
+        """Убрать из ответа то, что нельзя зачитывать вслух. У Meta нечего."""
+        return text
 
     # ── публичное API ─────────────────────────────────────────────────────
     def available(self):
@@ -409,8 +447,10 @@ class LlamaRunner(QObject):
 
         На всякий случай понимаем и старую openai-совместимую форму: если
         адрес в конфиге перевести обратно на chat/completions, разбор не
-        развалится.
+        развалится. Через неё же работает Groq, и встроенный поиск у него
+        отчитывается там — в executed_tools.
         """
+        asked = set()
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:
                 continue
@@ -440,9 +480,17 @@ class LlamaRunner(QObject):
                         yield "search", query
                 continue
 
-            for choice in ev.get("choices") or []:      # старая форма
-                piece = ((choice.get("delta") or {}).get("content")
-                         or (choice.get("message") or {}).get("content") or "")
+            for choice in ev.get("choices") or []:      # форма chat/completions
+                delta = choice.get("delta") or choice.get("message") or {}
+                # Встроенный поиск Groq отчитывается здесь же. Одно и то же
+                # событие приходит дважды — сначала без результатов, потом с
+                # ними, — поэтому повторы отсеиваем.
+                for tool in delta.get("executed_tools") or []:
+                    query = _tool_query(tool)
+                    if query and query not in asked:
+                        asked.add(query)
+                        yield "search", query
+                piece = delta.get("content") or ""
                 if isinstance(piece, str) and piece:
                     yield "text", piece
 
@@ -456,7 +504,7 @@ class LlamaRunner(QObject):
             emo = found
             self.emotion.emit(emo)
 
-        body = body.strip()
+        body = self._clean(body).strip()
         if not body:
             return emo, said
 

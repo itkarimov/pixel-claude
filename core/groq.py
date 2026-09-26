@@ -9,8 +9,9 @@
   * формат запроса — обычный OpenAI chat/completions, а не Responses API,
     поэтому приписка про характер идёт первым сообщением роли system, а не
     отдельным полем;
-  * поиска в интернете нет. У Meta он встроенный, здесь его взять неоткуда —
-    и обещать голосом нельзя, иначе она начнёт выдумывать курсы и новости;
+  * поиск включается инструментом `browser_search` и работает только у
+    gpt-oss. Отдельных моделей-агентов (groq/compound) на этом ключе нет,
+    а `web_search` Groq не принимает вовсе — отвечает 400;
   * картинок gpt-oss не понимает. Кадр с камеры до него не доходит, поэтому
     вместо кадра подставляем прямую строку — молчание она прочтёт как
     «всё по-прежнему» и уверенно расскажет, что видит человека.
@@ -23,6 +24,7 @@
 Берётся на console.groq.com/keys.
 """
 import os
+import re
 
 from core import llama
 from core.llama import HISTORY_TURNS, REMINDER, LlamaRunner
@@ -34,8 +36,19 @@ DEFAULT_URL = "https://api.groq.com/openai/v1"
 # gpt-oss-20b — самая дешёвая из вменяемых: отвечает мгновенно и по-русски
 # нормально. Есть ещё openai/gpt-oss-120b (умнее, медленнее) и qwen/qwen3-32b.
 DEFAULT_MODEL = "openai/gpt-oss-20b"
-MAX_TOKENS = 1024
+# С поиском запрос разбухает: результаты страниц подмешиваются в подсказку,
+# и на «какая погода» уходит под 30 тысяч входных токенов. Ответ при этом
+# короткий, но размышления и вызовы инструмента идут из этого же бюджета.
+MAX_TOKENS = 2048
 TEMPERATURE = 0.7
+
+SEARCH = (
+    "У ТЕБЯ ЕСТЬ ПОИСК В ИНТЕРНЕТЕ: если спрашивают про новости, курсы, "
+    "погоду, цены или что-то свежее — ищи, а не отвечай «не знаю» и не "
+    "пересказывай память. Назови источник коротко. "
+    "СНОСКИ ВИДА 【1†L5-L9】 В ОТВЕТ НЕ СТАВЬ: он зачитывается вслух, и "
+    "человек услышит мусор. "
+)
 
 NO_SEARCH = (
     "ИНТЕРНЕТА У ТЕБЯ НЕТ: поиска, новостей, курсов валют и погоды ты не "
@@ -50,9 +63,12 @@ NO_EYES = (
     "видишь, и предложи переключиться на Клода или Meta AI."
 )
 
-SYSTEM = llama.PERSONA + NO_SEARCH + llama.NO_TOOLS + NO_EYES
-
 BLIND = "[кадр с камеры сюда не доходит]"
+
+# Сноски на источники модель ставит и после прямого запрета — вслух они звучат
+# как мусор, поэтому вырезаем. Незакрытую в конце строки тоже: пока поток идёт,
+# хвост сноски может приехать следующим куском.
+CITES = re.compile(r"【[^】]*(?:】|$)")
 
 
 def endpoint(cfg):
@@ -83,16 +99,30 @@ class GroqRunner(LlamaRunner):
     """Мозг Groq. Всё поведение — от LlamaRunner, разное перечислено ниже."""
 
     brand = "Groq"
+    slug = "groq"
     store = STORE
-    system = SYSTEM
     key_hint = ("впиши groq_api_key в config.json или задай GROQ_API_KEY — "
                 "ключ дают на console.groq.com/keys")
+
+    @property
+    def system(self):
+        """Приписка зависит от настройки: обещать поиск выключенным нельзя."""
+        middle = SEARCH if self.searches() else NO_SEARCH
+        return (llama.PERSONA + self._identity() + middle
+                + llama.NO_TOOLS + NO_EYES)
+
+    def searches(self):
+        return bool(self.cfg.get("groq_web_search", True))
 
     def _key(self):
         return api_key(self.cfg)
 
     def _endpoint(self):
         return endpoint(self.cfg)
+
+    @staticmethod
+    def _clean(text):
+        return CITES.sub("", text)
 
     def _content(self, text, image):
         """Картинок модель не понимает — вместо кадра честная строка."""
@@ -115,4 +145,9 @@ class GroqRunner(LlamaRunner):
         effort = self.cfg.get("groq_reasoning_effort")
         if effort:
             payload["reasoning_effort"] = effort
+        # Поиск встроенный, ищет сама Groq. Имя инструмента именно такое:
+        # web_search она не принимает и отвечает 400, а модели-агенты
+        # groq/compound на обычном ключе недоступны.
+        if self.searches():
+            payload["tools"] = [{"type": "browser_search"}]
         return payload

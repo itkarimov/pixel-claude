@@ -211,9 +211,9 @@ class Shell(QObject):
             self.win.chat.append("system", f"мозг: {brain.brand} · {model}")
             self.win.chat.append("system", "инструментов нет — файлы и команды "
                                            "только у Клода")
-            if name == "groq":
-                self.win.chat.append("system", "и без интернета — поиск у "
-                                               "Meta AI и у Клода")
+            if name == "groq" and not brain.searches():
+                self.win.chat.append("system", "и без интернета: поиск "
+                                               "выключен в config.json")
         self.on_list(self._collect_sessions())      # у каждого мозга свой список
 
     # ── трей ──────────────────────────────────────────────────────────────
