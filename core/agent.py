@@ -123,6 +123,28 @@ def _short(value, limit=58):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# Частые отказы claude CLI приходят по-английски и ничего не говорят о том, что
+# делать. Переводим их в одну строку с командой, которую человек может набрать.
+TROUBLE = (
+    (re.compile(r"oauth|authenticat|unauthorized|\b401\b|/login", re.I),
+     "мозг Claude разлогинен — в терминале набери «claude auth login». "
+     "Пока можно переключиться кнопкой МОЗГ на Meta AI или Groq"),
+    (re.compile(r"rate.?limit|usage limit|\b429\b", re.I),
+     "у Claude кончился лимит — переключись кнопкой МОЗГ на Meta AI или Groq"),
+    (re.compile(r"ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network", re.I),
+     "claude не достучался до сети — проверь интернет"),
+)
+
+
+def explain(err):
+    """Что показать человеку вместо английского отказа CLI."""
+    text = str(err or "")
+    for pattern, hint in TROUBLE:
+        if pattern.search(text):
+            return hint
+    return _short(text, 200) or "claude завершился молча"
+
+
 def describe_tool(name, params):
     """Человекочитаемая строка «что я сейчас делаю»."""
     verb = TOOL_RU.get(name, name)
@@ -363,7 +385,7 @@ class AgentRunner(QObject):
         if self._busy:
             self._set_busy(False)
             self.emotion.emit("unhappy")
-            self.log.emit("error", _short(err, 200) or "claude завершился молча")
+            self.log.emit("error", explain(err))
         with self._lock:
             if self._proc is proc:
                 self._proc = None
@@ -409,7 +431,7 @@ class AgentRunner(QObject):
                 return
             if event.get("is_error"):
                 self.emotion.emit("unhappy")
-                self.log.emit("error", _short(event.get("result"), 200))
+                self.log.emit("error", explain(event.get("result")))
                 return
             text = (event.get("result") or "").strip()
             _, clean = split_emotion(text)

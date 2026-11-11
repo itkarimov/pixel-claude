@@ -316,10 +316,14 @@ class Portrait(QWidget):
         # перечёркивал лицо.
 
         if self._eye is not None:              # то, что она сейчас видит
-            k = max(1, min(EYE_SCALE_MAX, int(h / 220) + 1))
+            # Угол панели, а не угол кадра: кадр центрируется по ширине окна, и
+            # привязанный к нему глазок переезжал на середину портрета, стоило
+            # потянуть окно за край.
+            k = max(1, min(EYE_SCALE_MAX, self.width() // 300))
             ew, eh = self._eye.width() * k, self._eye.height() * k
-            ex = int(x) + 10
-            ey = max(int(y) + 10, min(self.mic.y() - eh - 8, int(y) + h - eh - 10))
+            ex, ey = 14, self.height() - 14 - eh
+            if ex + ew + 6 > self.cam.x():     # узкое окно: кнопки подъехали
+                ey = self.cam.y() - eh - 10
             p.fillRect(ex - 3, ey - 3, ew + 6, eh + 6, QColor(PANEL))
             p.drawPixmap(ex, ey, ew, eh, self._eye)
             p.setPen(accent)
