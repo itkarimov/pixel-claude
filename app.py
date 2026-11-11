@@ -158,6 +158,7 @@ class Shell(QObject):
         self.brains = {"claude": self.agent, "llama": self.llama,
                        "groq": self.groq}
         self.backend = "claude"
+        self.speaking = False
         self.speaker = Speaker(cfg)
         self.listener = Listener(cfg)
         self.eyes = Eyes(cfg)
@@ -278,6 +279,7 @@ class Shell(QObject):
         w.chat.session_new.connect(self.on_session_new)
         w.chat.sessions_needed.connect(self.on_sessions_needed)
         w.chat.brain_switched.connect(self.on_brain_switched)
+        w.chat.interrupted.connect(self.on_interrupt)
         self.tail_loaded.connect(self.on_tail)
         self.list_loaded.connect(self.on_list)
 
@@ -562,6 +564,8 @@ class Shell(QObject):
             self.speaker.say("Отменила.")
 
     def on_heard(self, text):
+        if self.speaking:           # заговорил поверх — значит, перебивает
+            self.speaker.shutup()
         if self.confirmer.pending():
             self._answer(text)
             return
@@ -579,13 +583,26 @@ class Shell(QObject):
     def on_busy(self, busy):
         self.busy = busy
         self.win.chat.set_status("думаю…" if busy else "готова")
+        self.win.chat.set_busy(busy or self.speaking)
 
     def on_speaking(self, speaking):
+        self.speaking = speaking
         self.win.portrait.set_talking(speaking)
-        if speaking:
-            self.listener.set_muted(True)
-        else:                       # пауза, чтобы не поймать собственный хвост
-            QTimer.singleShot(400, lambda: self.listener.set_muted(False))
+        self.win.chat.set_busy(speaking or self.busy)
+        # Микрофон не глушим совсем, иначе перебить её голосом нельзя в
+        # принципе. Вместо этого поднимаем порог: свой голос из колонок доходит
+        # до микрофона тише, чем человек, говорящий в него.
+        self.listener.set_loud_only(speaking)
+        if not speaking:            # хвост фразы ещё звучит в комнате
+            QTimer.singleShot(400, lambda: self.listener.set_loud_only(False))
+
+    def on_interrupt(self):
+        """Кнопка «СТОП» или Esc: замолчать и бросить начатое."""
+        self.speaker.shutup()
+        if self.busy:
+            self.brain.stop()
+            self.win.chat.append("system", "остановила")
+        self.win.chat.set_busy(False)
 
     def show(self):
         self.win.show()

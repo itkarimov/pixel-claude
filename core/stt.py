@@ -86,7 +86,13 @@ class FasterWhisper(Engine):
     def transcribe(self, audio):
         segments, _ = self.model.transcribe(
             audio, language=self.cfg.get("whisper_language", "ru"),
-            beam_size=1,
+            # Перебор по пяти лучам вместо одного стоит около 0.2 с и заметно
+            # реже путает похожие слова. На коротких репликах это главное.
+            beam_size=int(self.cfg.get("whisper_beam", 5)),
+            # Имена и термины, которых в обучающей выборке почти нет, иначе
+            # превращаются в похожие по звуку обычные слова.
+            initial_prompt=self.cfg.get("whisper_prompt") or None,
+            temperature=0.0,
             # свой VAD уже отрезал тишину, встроенный только тратит время
             vad_filter=False, without_timestamps=True,
             condition_on_previous_text=False)
@@ -167,6 +173,7 @@ class Listener(QObject):
         self._engine = None
         self._run = False
         self._muted = False
+        self._loud_only = False
         self._noise = 300.0
 
     # ── управление ────────────────────────────────────────────────────────
@@ -189,8 +196,19 @@ class Listener(QObject):
         self.status.emit("микрофон выключен")
 
     def set_muted(self, muted):
-        """Глушим захват, пока оболочка говорит вслух."""
+        """Глушим захват полностью. Нужен только на выключение микрофона."""
         self._muted = bool(muted)
+
+    def set_loud_only(self, on):
+        """
+        Режим «слушаю только громкое»: пока оболочка говорит.
+
+        Полная глухота на время речи — простое решение, но перебить её тогда
+        нельзя в принципе, а это главное, чего ждёшь от голосовой помощницы.
+        Поэтому слушаем дальше, но поднимаем порог: собственный голос из
+        колонок приходит в микрофон тише, чем человек, говорящий в него.
+        """
+        self._loud_only = bool(on)
 
     # ── поток ─────────────────────────────────────────────────────────────
     def _callback(self, indata, frames, time_info, status):
@@ -231,10 +249,16 @@ class Listener(QObject):
 
         self.status.emit("слушаю")
         start_rms = float(self.cfg.get("vad_start_rms", 900))
-        # 900 мс паузы — это почти секунда, которую человек просто ждёт. 550 мс
-        # хватает, чтобы отличить конец фразы от паузы между словами.
-        silence_need = int(self.cfg.get("vad_silence_ms", 550) / 30)
+        # Сколько тишины считать концом фразы. 550 мс экономили полсекунды, но
+        # резали человека на вдохе посреди мысли, а whisper на обрывке начинает
+        # сочинять. Лишние 350 мс ожидания дешевле, чем переспрашивать.
+        silence_need = int(self.cfg.get("vad_silence_ms", 900) / 30)
         min_frames = int(self.cfg.get("vad_min_speech_ms", 400) / 30)
+        # Предохранитель на случай, если шум держит порог и фраза не кончается.
+        max_frames = int(self.cfg.get("vad_max_speech_ms", 60000) / 30)
+        # Во сколько раз поднять порог, пока она говорит. Меньше — перебивать
+        # легче, но ловит собственный голос; больше — приходится говорить громче.
+        barge_gain = float(self.cfg.get("barge_in_gain", 2.5))
 
         pre, speech = [], []
         in_speech, silence, loud = False, 0, 0
@@ -248,6 +272,8 @@ class Listener(QObject):
             rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)) + 1e-6)
             self.level.emit(min(1.0, rms / 4000.0))
             thr = max(start_rms, self._noise * 3.0)
+            if self._loud_only and not in_speech:
+                thr *= barge_gain
 
             if not in_speech:
                 self._noise = self._noise * 0.97 + rms * 0.03      # шумовой порог
@@ -265,7 +291,7 @@ class Listener(QObject):
             else:
                 speech.append(frame)
                 silence = silence + 1 if rms < thr * 0.6 else 0
-                if silence >= silence_need:
+                if silence >= silence_need or len(speech) >= max_frames:
                     in_speech = False
                     self.listening.emit(False)
                     if len(speech) >= min_frames:

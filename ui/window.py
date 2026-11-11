@@ -403,7 +403,8 @@ class Chat(QWidget):
     session_picked = Signal(str)      # выбрана сессия из списка
     session_new = Signal()            # начать с чистого листа
     sessions_needed = Signal()        # открывают список — перечитай реестр
-    brain_switched = Signal(str)      # "claude" | "llama" | "groq"
+    brain_switched = Signal(str)
+    interrupted = Signal()      # "claude" | "llama" | "groq"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -463,6 +464,24 @@ class Chat(QWidget):
         self._style_brain(self.brain_name)
         self.brain.clicked.connect(self._brain_next)
 
+        # Кнопка «замолчи». Голосом перебить можно и так, но если распознавание
+        # уже раз ошиблось, кричать «стоп» в микрофон — так себе способ.
+        self.stop = QPushButton("СТОП")
+        self.stop.setFixedHeight(26)
+        self.stop.setCursor(Qt.PointingHandCursor)
+        self.stop.setToolTip("замолчать и бросить начатое (Esc)")
+        self.stop.setStyleSheet(f"""
+            QPushButton {{
+                background:{PANEL}; color:{RED}; border:3px solid #7d2f2f;
+                font-family:Consolas; font-size:11px; font-weight:bold;
+                letter-spacing:1px; padding:0 10px;
+            }}
+            QPushButton:hover {{ background:#2e2238; }}
+            QPushButton:disabled {{ color:{EDGE_DARK}; border-color:{EDGE_DARK}; }}
+        """)
+        self.stop.setEnabled(False)
+        self.stop.clicked.connect(self.interrupted.emit)
+
         self.status = QLabel("готова")
         self.status.setStyleSheet(
             f"color:{GREY}; font-family:Consolas; font-size:11px; padding:2px 6px;")
@@ -478,6 +497,7 @@ class Chat(QWidget):
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
         bottom.addWidget(self.brain, 0)
+        bottom.addWidget(self.stop, 0)
         bottom.addStretch(1)
         bottom.addWidget(self.status, 0)
 
@@ -560,6 +580,10 @@ class Chat(QWidget):
     def set_status(self, text):
         self.status.setText(text)
 
+    def set_busy(self, busy):
+        """Пока она говорит или работает — кнопку «СТОП» можно нажать."""
+        self.stop.setEnabled(bool(busy))
+
 
 class MainWindow(QWidget):
     """Окно прячется в трей, а не закрывается: процесс claude держит сессию."""
@@ -584,6 +608,13 @@ class MainWindow(QWidget):
         lay.setSpacing(8)
         lay.addWidget(self.portrait, int(share * 100))
         lay.addWidget(self.chat, int((1 - share) * 100))
+
+    def keyPressEvent(self, event):
+        """Esc — то же, что кнопка «СТОП»: замолчать и бросить начатое."""
+        if event.key() == Qt.Key_Escape:
+            self.chat.interrupted.emit()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event):
         if self.allow_quit:

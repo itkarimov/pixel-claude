@@ -43,20 +43,53 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 NOWINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-MAX_CHARS = 400
+# Сколько текста уходит в движок за один заход. Это не предел реплики: длинное
+# делится по границам предложений и читается подряд. Раньше здесь стояло 400 и
+# всё лишнее просто отрезалось — развёрнутый ответ обрывался на полуслове.
+PIECE = 600
 RATE = 24000                 # частота, в которой играем
 CHUNK = 2400                 # 50 мс — шаг чтения из декодера
 
+# Точка, вопрос, восклицание или перевод строки, за которыми идёт пробел.
+BREAK = re.compile(r"(?<=[.!?…])\s+|\n+")
+
 
 def clean_for_speech(text):
-    """Выкидывает всё, что голосом звучит мусором."""
+    """Выкидывает всё, что голосом звучит мусором. Длину не трогает."""
     text = re.sub(r"```.*?```", " ", text or "", flags=re.S)
     text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[*_#>|]+", " ", text)
     text = re.sub(r"https?://\S+", " ссылка ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:MAX_CHARS]
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_for_speech(text, limit=PIECE):
+    """
+    Длинную реплику — на куски по границам предложений.
+
+    Синтезаторы на длинном тексте либо захлёбываются, либо молча обрезают
+    хвост. Режем сами и читаем куски подряд: пауза между ними неотличима от
+    паузы между предложениями, зато ничего не теряется.
+    """
+    parts, piece = [], ""
+    for sentence in BREAK.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        while len(sentence) > limit:          # одно предложение длиннее куска
+            cut = sentence.rfind(" ", 0, limit) or limit
+            parts.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if len(piece) + len(sentence) + 1 > limit:
+            if piece:
+                parts.append(piece)
+            piece = sentence
+        else:
+            piece = f"{piece} {sentence}".strip()
+    if piece:
+        parts.append(piece)
+    return parts
 
 
 class Speaker(QObject):
@@ -83,9 +116,8 @@ class Speaker(QObject):
         return (self.cfg.get("voice_engine") or "silero").lower()
 
     def say(self, text):
-        text = clean_for_speech(text)
-        if text:
-            self._q.put(text)
+        for piece in split_for_speech(clean_for_speech(text)):
+            self._q.put(piece)
 
     def warmup(self):
         """
@@ -282,7 +314,10 @@ class Speaker(QObject):
             except Exception as exc:
                 self.status.emit(f"озвучка не вышла: {exc}")
             finally:
-                if self._sounding:
+                # «Замолчала» — только когда очередь пуста. Длинный ответ идёт
+                # кусками, и если гасить признак между ними, портрет моргает
+                # ртом, а микрофон успевает разглушиться и поймать её же хвост.
+                if self._sounding and self._q.empty():
                     self._sounding = False
                     self.speaking.emit(False)
 
