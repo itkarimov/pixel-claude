@@ -17,6 +17,8 @@ __pycache__/
 
 # забракованный арт первой версии, пересобирается tools/gen_character.py
 assets/sprites_generated/
+# прежний набор кадров, пересобирается tools/slice_ref.py из assets/ref.png
+assets/sprites_ref/
 
 # локальные настройки: рабочая папка и прочее, репозиторий публичный
 config.json

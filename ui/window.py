@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """Пиксельное окно: сверху портрет с эмоциями, снизу лента сессии."""
+import math
 import os
 import random
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QElapsedTimer, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTextEdit, QVBoxLayout, QWidget)
@@ -33,8 +34,22 @@ BRAIN_COLOR = {"claude": (GREEN, "#2f7d55"),
 KIND_MARK = {"user": "›", "assistant": "◆", "tool": "·",
              "system": "—", "error": "!"}
 
-EYE_W = 44               # ширина предпросмотра камеры в арт-пикселях
-EYE_SCALE_MAX = 2        # крупнее делать незачем: он не должен спорить с лицом
+EYE_W = 44               # ширина предпросмотра камеры в точках исходника
+EYE_SCALE_MAX = 3        # крупнее делать незачем: он не должен спорить с лицом
+
+# Простой. Пока к ней не обращаются, портрет не стоит столбом: раз в полминуты
+# она меняет позу на несколько секунд и возвращается обратно. Позы берутся из
+# того же листа эмоций, поэтому лицо и свет совпадают.
+IDLE_FRAMES = ("idle_hand", "idle_calm", "idle_doze")
+IDLE_AFTER = (14000, 26000)   # сколько ждать до смены позы
+IDLE_HOLD = (4500, 9000)      # сколько её держать
+# Уходить в простой можно только из спокойного лица: разворачивать в него
+# злость или слёзы — значит терять то, что она только что сказала.
+IDLE_FROM = ("neutral", "smile", "happy", "think", "relief", "tired")
+
+FADE_MS = 260.0          # переход между кадрами
+BREATH_MS = 4600.0       # вдох-выдох целиком
+BREATH_PX = 2.5          # размах дыхания по вертикали
 
 
 class MicButton(QPushButton):
@@ -75,7 +90,7 @@ class MicButton(QPushButton):
 
 
 class Portrait(QWidget):
-    """Портрет: спрайт эмоции, индикатор речи, кнопки микрофона и камеры."""
+    """Портрет: кадр эмоции, индикатор речи, кнопки микрофона и камеры."""
 
     mic_toggled = Signal(bool)
     cam_toggled = Signal(bool)
@@ -84,13 +99,15 @@ class Portrait(QWidget):
         super().__init__(parent)
         self.dir = sprites_dir
         self.cache = {}
-        self.emotion = "neutral"
+        self.scaled = {}
+        self.emotion = "neutral"          # что попросил мозг
+        self.shown = "neutral"            # что на экране прямо сейчас
         self.talking = False
         self.level = 0.0
-        self._phase = 0
-        self._breath = 0
+        self._from = None                 # кадр, из которого идёт переход
+        self._fade_at = 0
         self._eye = None                  # кадр с камеры для предпросмотра
-        self.canvas = QColor(BG)          # цвет фона берём из самого спрайта
+        self.canvas = QColor(BG)          # цвет фона берём из самого кадра
 
         self.mic = MicButton("МИК ВЫКЛ", self)
         self.mic.setCheckable(True)
@@ -106,16 +123,20 @@ class Portrait(QWidget):
         self.cam.toggled.connect(self._on_cam)
         self._style_btn(self.cam, False)
 
-        # дыхание: спрайт качается на один арт-пиксель, чтобы портрет жил
-        self._breath_timer = QTimer(self)
-        self._breath_timer.timeout.connect(self._breathe)
-        self._breath_timer.start(760)
-
+        self._clock = QElapsedTimer()
+        self._clock.start()
         self._anim = QTimer(self)
-        self._anim.timeout.connect(self._tick)
-        self._anim.start(140)
+        self._anim.timeout.connect(self.update)
+        self._anim.start(40)              # 25 кадров в секунду, хватает дыханию
 
-    # ── спрайты ───────────────────────────────────────────────────────────
+        # простой: через паузу она меняет позу и возвращается обратно
+        self._idle = QTimer(self)
+        self._idle.setSingleShot(True)
+        self._idle.timeout.connect(self._idle_step)
+        self._idling = False
+        self._plan_idle()
+
+    # ── кадры ─────────────────────────────────────────────────────────────
     def _pix(self, name):
         if name not in self.cache:
             path = os.path.join(self.dir, f"{name}.png")
@@ -127,29 +148,72 @@ class Portrait(QWidget):
                 self.canvas = QColor(pix.toImage().pixel(1, 1))
         return self.cache[name]
 
+    def _fitted(self, name, w, h):
+        """Кадр под размер панели. Тянем один раз, а не каждую отрисовку."""
+        key = (name, w, h)
+        if key not in self.scaled:
+            pix = self._pix(name)
+            if pix is None:
+                return None
+            if len(self.scaled) > 8:        # растянутые кадры тяжёлые
+                self.scaled.clear()
+            self.scaled[key] = pix.scaled(w, h, Qt.KeepAspectRatio,
+                                          Qt.SmoothTransformation)
+        return self.scaled[key]
+
+    def _show(self, name):
+        """Сменить кадр переходом, чтобы лицо не перещёлкивалось рывком."""
+        if name == self.shown or self._pix(name) is None:
+            return
+        self._from = self.shown
+        self._fade_at = self._clock.elapsed()
+        self.shown = name
+        self.update()
+
     def set_emotion(self, emotion):
-        if self._pix(emotion) is not None:
-            self.emotion = emotion
-            self.update()
+        if self._pix(emotion) is None:
+            return
+        self.emotion = emotion
+        self._idling = False
+        self._plan_idle()
+        self._show(emotion)
 
     def set_talking(self, talking):
         self.talking = talking
+        if talking and self._idling:      # заговорила, поза простоя ни к чему
+            self._idling = False
+            self._show(self.emotion)
         self.update()
 
     def set_level(self, level):
         self.level = level
         self.mic.set_level(level)
 
-    # ── анимация ──────────────────────────────────────────────────────────
-    def _breathe(self):
-        self._breath = (self._breath + 1) % 4
-        self._breath_timer.start(random.randint(680, 900))
-        self.update()
+    # ── простой ───────────────────────────────────────────────────────────
+    def _plan_idle(self):
+        self._idle.start(random.randint(*IDLE_AFTER))
 
-    def _tick(self):
-        if self.talking:
-            self._phase = (self._phase + 1) % 4
-            self.update()
+    def _idle_step(self):
+        """
+        Пока её не трогают, она время от времени меняет позу: подпирает щёку,
+        прикрывает глаза, задрёмывает. Раньше портрет качался вверх-вниз на
+        пиксель, и это читалось как дёрганье, а не как ожидание.
+        """
+        if self.talking or self.emotion not in IDLE_FROM:
+            self._plan_idle()
+            return
+        if self._idling:
+            self._idling = False
+            self._show(self.emotion)
+            self._plan_idle()
+            return
+        poses = [f for f in IDLE_FRAMES if self._pix(f) is not None]
+        if not poses:
+            self._plan_idle()
+            return
+        self._idling = True
+        self._show(random.choice(poses))
+        self._idle.start(random.randint(*IDLE_HOLD))
 
     # ── микрофон и камера ─────────────────────────────────────────────────
     @staticmethod
@@ -181,7 +245,7 @@ class Portrait(QWidget):
         self.cam_toggled.emit(on)
 
     def set_camera_frame(self, jpeg):
-        """Кадр для предпросмотра. Мельчим — иначе видео выбивается из стиля."""
+        """Кадр для предпросмотра. Мельчим, иначе видео забивает лицо."""
         pix = QPixmap()
         if not pix.loadFromData(jpeg, "JPG") or pix.isNull():
             return
@@ -189,7 +253,7 @@ class Portrait(QWidget):
         self.update()
 
     def camera_failed(self):
-        """Камера не открылась — кнопку отжимаем, чтобы не врала."""
+        """Камера не открылась, кнопку отжимаем, чтобы не врала."""
         self.cam.blockSignals(True)
         self.cam.setChecked(False)
         self.cam.setText("ГЛАЗА ВЫКЛ")
@@ -202,56 +266,64 @@ class Portrait(QWidget):
         y = self.height() - self.mic.height() - 14
         self.mic.move(self.width() - self.mic.width() - 14, y)
         self.cam.move(self.width() - self.mic.width() - self.cam.width() - 22, y)
+        self.scaled.clear()
         super().resizeEvent(event)
 
     # ── отрисовка ─────────────────────────────────────────────────────────
+    def _breath(self):
+        """Снос по вертикали на вдохе: один медленный синус, без рывков."""
+        return math.sin(self._clock.elapsed() / BREATH_MS * 2 * math.pi) * BREATH_PX
+
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
-        pix = self._pix(self.emotion) or self._pix("neutral")
+        pix = (self._fitted(self.shown, self.width(), self.height())
+               or self._fitted("neutral", self.width(), self.height()))
         if pix is None:
             p.fillRect(self.rect(), QColor(BG))
             p.end()
             return
         p.fillRect(self.rect(), self.canvas)
 
-        # целочисленный масштаб — иначе пиксели «плывут»
-        scale = max(1, int(min(self.width() / pix.width(),
-                               self.height() / pix.height())))
-        w, h = pix.width() * scale, pix.height() * scale
-        x, y = (self.width() - w) // 2, (self.height() - h) // 2
-        breath = (0, 1, 0, -1)[self._breath] * scale
-        p.drawPixmap(x, y + breath, w, h, pix)   # качается только сам спрайт
+        w, h = pix.width(), pix.height()
+        x, y = (self.width() - w) / 2, (self.height() - h) / 2
+        rect = QRectF(x, y + self._breath(), w, h)
 
-        # индикаторы на светлом фоне зелёным не читаются — берём тёмные чернила
+        done = (self._clock.elapsed() - self._fade_at) / FADE_MS
+        if self._from is not None and done < 1.0:
+            old = self._fitted(self._from, self.width(), self.height())
+            if old is not None:
+                p.drawPixmap(rect, old, QRectF(old.rect()))
+                p.setOpacity(max(0.0, min(1.0, done)))
+        elif self._from is not None:
+            self._from = None
+        p.drawPixmap(rect, pix, QRectF(pix.rect()))
+        p.setOpacity(1.0)
+
+        # индикаторы на светлом фоне зелёным не читаются, берём тёмные чернила
         light = self.canvas.lightness() > 128
         accent = QColor("#2b3550") if light else QColor(GREEN)
         track = QColor("#8f9aa8") if light else QColor(EDGE_DARK)
 
         p.setPen(track)
-        p.drawRect(x, y, w - 1, h - 1)
+        p.drawRect(int(x), int(y), w - 1, h - 1)
 
         if self.talking:                       # столбики «говорю»
-            bx, by, bw = x + 10, y + h - 14, 5
+            phase = int(self._clock.elapsed() / 140)
+            bx, by, bw = int(x) + 10, int(y) + h - 14, 5
             for i in range(4):
-                hh = 4 + ((self._phase + i) % 4) * 4
+                hh = 4 + ((phase + i) % 4) * 4
                 p.fillRect(bx + i * (bw + 3), by - hh, bw, hh, accent)
 
         # Уровень громкости рисует сама кнопка микрофона: поверх портрета он
-        # перечёркивал лицо. Цвет ей подбирать не надо — фон кнопки всегда
-        # тёмный, а этот accent подстроен под светлый фон спрайта и в кнопке
-        # сливается со всем подряд.
+        # перечёркивал лицо.
 
         if self._eye is not None:              # то, что она сейчас видит
-            k = max(1, min(EYE_SCALE_MAX, scale))   # крупные пиксели — так в стиле
+            k = max(1, min(EYE_SCALE_MAX, int(h / 220) + 1))
             ew, eh = self._eye.width() * k, self._eye.height() * k
-            # левый нижний угол, вровень с кнопками: лицо должно оставаться
-            # открытым, а глазок — рядом с кнопкой, которая его включает
-            ex = x + 10
-            # над кнопками, а не вровень с ними: в узком окне кнопка ГЛАЗА
-            # доезжает до левого края и предпросмотр оказывался под ней
-            ey = max(y + 10, min(self.mic.y() - eh - 8, y + h - eh - 10))
+            ex = int(x) + 10
+            ey = max(int(y) + 10, min(self.mic.y() - eh - 8, int(y) + h - eh - 10))
             p.fillRect(ex - 3, ey - 3, ew + 6, eh + 6, QColor(PANEL))
             p.drawPixmap(ex, ey, ew, eh, self._eye)
             p.setPen(accent)
