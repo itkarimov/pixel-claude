@@ -52,7 +52,9 @@
   "speak_actions": false,
 
   "_распознавание": "base против small: 1.6 с вместо 5.6 с на той же фразе при том же тексте. tiny ещё вдвое быстрее, но чаще путает имена и термины.",
-  "stt_backend": "faster-whisper",
+  "stt_backend": "gigaam",
+  "gigaam_model": "gigaam-v3-e2e-ctc",
+  "gigaam_quantization": "int8",
   "whisper_model": "base",
   "whisper_language": "ru",
   "whisper_beam": 5,

@@ -1,6 +1,7 @@
 PySide6-Essentials>=6.6
 sounddevice>=0.4.6
-faster-whisper>=1.0
+onnx-asr[cpu,hub]>=0.12      # основной движок распознавания: GigaAM
+faster-whisper>=1.0         # запасной движок распознавания
 edge-tts>=6.1
 numpy>=1.24
 pillow>=10.0
@@ -8,5 +9,6 @@ requests>=2.31          # второй мозг: Meta AI (Llama) по http
 
 # по желанию:
 #   opencv-python-headless   камера (кнопка ГЛАЗА)
-#   piper-tts                локальный синтез вместо edge-tts
+#   piper-tts                запасной локальный синтез
+#   torch (CPU)              нужен Silero, основному голосу: см. README
 #   sherpa-onnx              второй движок распознавания, stt_backend: onnx
