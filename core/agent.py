@@ -97,28 +97,70 @@ TOOL_RU = {
 # Имена, которые в открытой папке читать нельзя. Прочитанное уходит в модель и
 # звучит вслух: ключ, один раз попавший в разговор, оттуда уже не убрать.
 SECRET_GLOBS = (".env", ".env.*", "*.env", "*key*", "*.pem", "*.p12", "*.pfx",
-                ".mcp.json", "credentials*", "token*.json", "*secret*")
+                ".mcp.json", "credentials*", ".credentials*", "token*.json",
+                "*secret*", "*password*", "*passwd*", "id_rsa*", "id_ed25519*",
+                "id_ecdsa*", "*.ppk", "*.kdbx", "*.jks", "*.keystore",
+                ".npmrc", ".pypirc", ".netrc", ".htpasswd", "*.ovpn")
+
+# Папки, которые не читаем целиком: там живут чужие пароли, куки и сессии.
+# Имена внутри них ничего не говорят о содержимом, масками их не поймать —
+# закрываем по папке.
+SECRET_DIRS = (".ssh", ".claude", ".claude-mem", ".aws", ".gnupg", ".azure",
+               ".kube", ".docker", ".android", ".config/gh", ".vscode",
+               "AppData", "Cookies", "Local Settings")
+
+# Команды, которыми можно стереть или подвинуть файл мимо инструментов Write и
+# Edit. Запрет на них не абсолютен — всё, что запускает код, в принципе может
+# что угодно, — но он закрывает главный здешний риск: ослышавшееся
+# распознавание речи и режим acceptEdits, который ничего не переспросит.
+BASH_DESTRUCTIVE = ("rm", "rmdir", "del", "erase", "unlink", "shred", "truncate",
+                    "mv", "move", "ren", "rename", "cp", "copy", "xcopy",
+                    "robocopy", "dd", "fsutil", "format", "diskpart", "takeown",
+                    "icacls", "attrib", "Remove-Item", "Move-Item",
+                    "Rename-Item", "Clear-Content", "Set-Content",
+                    "Add-Content", "Out-File", "ri", "rni", "mi", "sc",
+                    "ac", "rd")
+
+
+def _deny_path(path):
+    """
+    Путь в том виде, в каком его понимают запреты claude.
+
+    Формат выяснен замером (tools/deny_test.py), и он неочевиден:
+    относительные маски вида `Read(**/*deploy_key*)` **не работают вовсе** —
+    с ними claude спокойно печатает приватный ключ. Срабатывает только
+    абсолютный путь в форме `//c/Trading/…`.
+    """
+    full = os.path.abspath(os.path.expanduser(path))
+    drive, rest = os.path.splitdrive(full)
+    return ("//" + drive.rstrip(":").lower() + rest.replace("\\", "/")).rstrip("/")
 
 
 def deny_rules(dirs):
     """
-    Запреты чтения секретов для каждой открытой папки.
+    Чем закрыта каждая открытая папка: секреты не читаем, файлы не трогаем.
 
-    Формат путей выяснен замером (tools/deny_test.py), и он неочевиден:
-    относительные маски вида `Read(**/*deploy_key*)` **не работают вовсе** —
-    с ними claude спокойно печатает приватный ключ. Срабатывает только
-    абсолютный путь в форме `//c/Trading/…`. Правило пишем и для самой папки,
-    и для вложенных.
+    Папки из extra_dirs открыты только на чтение. Рабочая папка живёт по другим
+    правилам — в ней она и пишет, и правит, это её работа.
+
+    Правило пишется и для самой папки, и для вложенных: одно без другого ловит
+    половину случаев.
     """
     rules = []
     for path in dirs:
-        full = os.path.abspath(os.path.expanduser(path))
-        drive, rest = os.path.splitdrive(full)
-        base = "//" + drive.rstrip(":").lower() + rest.replace("\\", "/")
-        base = base.rstrip("/")
+        base = _deny_path(path)
         for glob in SECRET_GLOBS:
             rules.append(f"Read({base}/{glob})")
             rules.append(f"Read({base}/**/{glob})")
+        for folder in SECRET_DIRS:
+            rules.append(f"Read({base}/{folder})")
+            rules.append(f"Read({base}/{folder}/**)")
+        for tool in ("Write", "Edit", "NotebookEdit"):
+            rules.append(f"{tool}({base})")
+            rules.append(f"{tool}({base}/**)")
+    for verb in BASH_DESTRUCTIVE:
+        rules.append(f"Bash({verb})")
+        rules.append(f"Bash({verb}:*)")
     return rules
 
 
@@ -327,9 +369,6 @@ class AgentRunner(QObject):
         # ради хуков — значит, нужное разрешаем флагом. Поиск в вебе оболочке
         # нужен: спросить голосом «что там с курсом» и услышать «не могу» —
         # это не помощница.
-        allowed = self.cfg.get("allowed_tools")
-        if allowed:
-            cmd += ["--allowedTools"] + list(allowed)
         # Папки за пределами рабочей: без них она честно отвечает «доступа нет».
         # Существующие проверяем сами — на несуществующей CLI падает при старте,
         # а выглядит это как «оболочка не поднялась».
@@ -337,11 +376,10 @@ class AgentRunner(QObject):
                  if os.path.isdir(os.path.expanduser(d))]
         if extra:
             cmd += ["--add-dir"] + extra
-        # Запреты сильнее разрешений. Секреты в открытых папках закрываем сами,
-        # не полагаясь на конфиг: открыли папку — защита появилась вместе с ней.
-        denied = deny_rules(extra) + list(self.cfg.get("denied_tools") or [])
-        if denied:
-            cmd += ["--disallowedTools"] + denied
+        # Разрешения и запреты идут файлом, а не флагами: на десяток открытых
+        # папок правил набирается под тысячу, а командная строка Windows
+        # обрывается на 32 тысячах символов — и обрывается молча.
+        cmd += ["--settings", self._write_settings(extra)]
         if self.cfg.get("permission_mode"):
             cmd += ["--permission-mode", self.cfg["permission_mode"]]
         if self.cfg.get("model"):
@@ -349,6 +387,24 @@ class AgentRunner(QObject):
         if self.session_id:
             cmd += ["--resume", self.session_id]
         return cmd
+
+    def _write_settings(self, extra):
+        """
+        Файл разрешений для CLI. Пересобирается на каждый запуск процесса.
+
+        Запреты сильнее разрешений, и секреты в открытых папках закрываются
+        сами, не полагаясь на конфиг: открыли папку — защита появилась вместе
+        с ней. Поэтому список собирается здесь, а не переписывается руками.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, ".pixel_settings.json")
+        data = {"permissions": {
+            "deny": deny_rules(extra) + list(self.cfg.get("denied_tools") or []),
+            "allow": list(self.cfg.get("allowed_tools") or []),
+        }}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return path
 
     def _spawn(self, wait=False):
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
