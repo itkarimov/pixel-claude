@@ -41,8 +41,12 @@
   "stream_partial": true,
 
   "_голос": "voice_engine: piper — локально, 0.30 с до звука, без интернета. edge — голос живее, но каждая фраза открывает новое соединение и это 1.7 с. system — встроенный голос Windows.",
-  "voice_engine": "piper",
+  "voice_engine": "silero",
   "piper_voice": "ru_RU-irina-medium",
+  "silero_model": "v5_6_ru",
+  "silero_speaker": "xenia",
+  "silero_rate": 48000,
+  "silero_threads": 4,
   "voice": "ru-RU-SvetlanaNeural",
   "tts_rate": "+8%",
   "speak_actions": false,

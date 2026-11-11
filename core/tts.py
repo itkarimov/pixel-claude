@@ -2,24 +2,32 @@
 """
 Озвучка ответов.
 
-Главное здесь — не ждать. Замеры до первого звука на этой машине:
+Главное здесь — не ждать. Замеры до первого звука на этой машине, 8 ядер:
 
-    edge-tts целиком в файл, потом ffmpeg   1.86 с   ← как было сначала
-    edge-tts потоком, соединение свежее     0.62 с
-    edge-tts потоком после паузы            1.70 с   ← так и живёт на практике
-    piper локально                          0.30 с
+    SAPI, системный голос Windows           долго и роботом
+    edge-tts потоком, соединение холодное   3.9 с
+    edge-tts потоком, прогретое             1.4 с
+    piper локально                          0.34 с
+    Silero v5 локально                      0.5 с на всю фразу
 
 Ловушка edge-tts: каждая фраза открывает новое соединение с сервисом Microsoft,
-и рукопожатие TLS стоит около секунды. Подряд идущие фразы укладываются в 0.6 с
-за счёт переиспользования сессии, но пауза между репликами всё обнуляет — а у
-голосового помощника паузы как раз и есть норма жизни.
+и рукопожатие стоит секунды, а пауза между репликами прогрев обнуляет — у
+голосовой помощницы паузы как раз и есть норма жизни. Вдобавок Microsoft время
+от времени закрывает эндпоинт для старых версий библиотеки: 11 ноября 2026 года
+edge-tts 7.2.8 стал получать 403 на все голоса, озвучка молча скатывалась до
+SAPI, и голос звучал роботом. Лечится обновлением edge-tts, но полагаться на
+это как на основной путь не стоит.
 
-Поэтому по умолчанию синтез локальный (piper): втрое быстрее, работает без
-интернета и никуда не отправляет текст ответа. Голос edge-tts звучит живее —
-кто предпочтёт его, ставит "voice_engine": "edge" и платит те самые 1.4 с.
+Поэтому синтез по умолчанию локальный. Silero считает фразу целиком, без потока,
+зато в двенадцать раз быстрее реального времени — ждать нечего. Звучит он живее
+piper, которому русского голоса дали всего час записей.
 
-Порядок отступления, если основной путь не сложился: piper → edge потоком →
-edge файлом → системный голос Windows.
+Модель Silero — архив torch.package: при загрузке исполняется код, упакованный
+в него авторами. Поэтому файл кладётся в assets/voices руками, с их сайта
+models.silero.ai, и сам движок ничего не качает. Весит 141 МБ, в репозиторий не
+попадает — как и голоса piper.
+
+Порядок отступления: silero → piper → edge потоком → edge файлом → SAPI.
 """
 import asyncio
 import os
@@ -66,11 +74,13 @@ class Speaker(QObject):
         self._sounding = False
         self._piper = None                  # модель локального синтеза
         self._piper_lock = threading.Lock()
+        self._silero = None                 # None — не пробовали, False — не вышло
+        self._silero_lock = threading.Lock()
         threading.Thread(target=self._worker, daemon=True).start()
 
     def engine(self):
-        """piper — локально и быстро, edge — через сеть и красивее, system — SAPI."""
-        return (self.cfg.get("voice_engine") or "piper").lower()
+        """silero и piper — локально, edge — через сеть, system — SAPI."""
+        return (self.cfg.get("voice_engine") or "silero").lower()
 
     def say(self, text):
         text = clean_for_speech(text)
@@ -87,7 +97,12 @@ class Speaker(QObject):
         """
         def work():
             try:
-                if self.engine() == "piper":
+                if self.engine() == "silero":
+                    if self._load_silero():
+                        self._synth_silero("раз")        # греем граф
+                        self.status.emit("готова")
+                        return
+                if self.engine() in ("silero", "piper"):
                     voice = self._load_piper()
                     if voice is not None:
                         for _ in voice.synthesize("раз"):     # греем граф
@@ -102,6 +117,81 @@ class Speaker(QObject):
                 pass
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ── Silero: лучший из локальных по-русски ─────────────────────────────
+    def _silero_path(self):
+        name = self.cfg.get("silero_model", "v5_6_ru")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return self.cfg.get("silero_file") or os.path.join(
+            root, "assets", "voices", f"{name}.pt")
+
+    def _load_silero(self):
+        """
+        Модель Silero — архив torch.package: при загрузке исполняется код,
+        упакованный в него авторами. Поэтому файл берётся только с их сайта
+        (models.silero.ai) и только тот, что положен в assets/voices руками,
+        сам ничего не качаем.
+        """
+        with self._silero_lock:
+            if self._silero is not None:
+                return self._silero
+            path = self._silero_path()
+            if not os.path.exists(path):
+                self.status.emit("нет модели Silero — беру запасной голос")
+                self._silero = False
+                return False
+            try:
+                import torch
+
+                torch.set_num_threads(int(self.cfg.get("silero_threads", 4)))
+                model = torch.package.PackageImporter(path).load_pickle(
+                    "tts_models", "model")
+                model.to(torch.device("cpu"))
+                self._silero = model
+            except Exception as exc:
+                self.status.emit(f"Silero не поднялся: {exc}")
+                self._silero = False
+            return self._silero
+
+    def _synth_silero(self, text):
+        """Волна int16 или None. Silero считает фразу целиком, зато мгновенно."""
+        model = self._load_silero()
+        if not model:
+            return None, 0
+        rate = int(self.cfg.get("silero_rate", 48000))
+        speaker = self.cfg.get("silero_speaker", "kseniya")
+        try:
+            audio = model.apply_tts(text=text, speaker=speaker,
+                                    sample_rate=rate, put_accent=True,
+                                    put_yo=True)
+        except Exception as exc:
+            self.status.emit(f"Silero не справился: {exc}")
+            return None, 0
+        return (np.clip(audio.numpy(), -1.0, 1.0) * 32767).astype(
+            np.int16).tobytes(), rate
+
+    def _speak_silero(self, text):
+        """True, если отыграли локально. False — пусть пробуют запасные пути."""
+        pcm, rate = self._synth_silero(text)
+        if not pcm:
+            return False
+        try:
+            import sounddevice as sd
+        except ImportError:
+            return False
+        try:
+            with sd.RawOutputStream(samplerate=rate, channels=1,
+                                    dtype="int16", blocksize=0) as out:
+                self._begin()
+                # пишем кусками, иначе «замолчи» не сработает до конца фразы
+                for i in range(0, len(pcm), CHUNK * 2):
+                    if self._stop.is_set():
+                        break
+                    out.write(pcm[i:i + CHUNK * 2])
+        except Exception as exc:
+            self.status.emit(f"локальный голос сорвался: {exc}")
+            return False
+        return True
 
     # ── локальный синтез: быстро и без сети ───────────────────────────────
     def _piper_model_path(self):
@@ -176,7 +266,9 @@ class Speaker(QObject):
             text = self._q.get()
             self._stop.clear()
             try:
-                if self.engine() == "piper" and self._speak_piper(text):
+                if self.engine() == "silero" and self._speak_silero(text):
+                    pass
+                elif self.engine() in ("silero", "piper") and self._speak_piper(text):
                     pass
                 elif self.engine() != "system" and self._stream_edge(text):
                     pass
