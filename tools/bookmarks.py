@@ -28,7 +28,9 @@ import re
 import sys
 import webbrowser
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# reconfigure, а не новый TextIOWrapper: обёртка закрывает поток, когда её
+# собирает сборщик мусора, и второй такой модуль в одном процессе гасит первый
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 LOCAL = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
 
