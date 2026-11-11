@@ -332,6 +332,26 @@ class Portrait(QWidget):
         p.end()
 
 
+class Feed(QTextEdit):
+    """
+    Лента разговора.
+
+    При смене размера окна текст перетекает по новой ширине, а полоса прокрутки
+    остаётся на прежнем числе — и это число указывает уже на другое место.
+    Выглядит как «диалог прыгнул куда-то в середину». Доматываем вниз сами, но
+    не сразу: документ раскладывается заново уже после resizeEvent, и maximum
+    в этот момент ещё старый.
+    """
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.to_bottom)
+
+    def to_bottom(self):
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+
 class ConfirmBar(QWidget):
     """
     Полоса «выполнять?»: показывает придержанную просьбу и две кнопки.
@@ -439,7 +459,7 @@ class Chat(QWidget):
         """)
         self.btn_new.clicked.connect(self.session_new.emit)
 
-        self.view = QTextEdit(readOnly=True)
+        self.view = Feed(readOnly=True)
         self.view.setStyleSheet(
             f"QTextEdit {{ background:#0d0a16; color:{INK}; "
             f"border:3px solid {EDGE_DARK}; padding:6px; }}")
@@ -571,8 +591,7 @@ class Chat(QWidget):
         safe = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         self.view.append(
             f'<span style="color:{color}">{mark}&nbsp;{safe}</span>')
-        bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        self.view.to_bottom()
 
     def clear(self):
         self.view.clear()
@@ -594,9 +613,13 @@ class MainWindow(QWidget):
         super().__init__()
         self.allow_quit = False
         self.setWindowTitle("Pixel Claude")
-        self.resize(int(cfg.get("window_width", 552)),
-                    int(cfg.get("window_height", 704)))
         self.setMinimumSize(340, 600)
+        # Ноль в настройках — открываться самым узким, какой разрешает раскладка.
+        # Окно живёт сбоку от всего остального, и широким оно там мешает.
+        width = int(cfg.get("window_width", 0))
+        height = int(cfg.get("window_height", 0))
+        self.resize(width, height) if width and height else self.resize(
+            self.minimumSize())
         self.setStyleSheet(f"background:{BG};")
 
         self.portrait = Portrait(sprites_dir)
