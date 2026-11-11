@@ -34,8 +34,10 @@ BRAIN_COLOR = {"claude": (GREEN, "#2f7d55"),
 KIND_MARK = {"user": "›", "assistant": "◆", "tool": "·",
              "system": "—", "error": "!"}
 
-EYE_W = 44               # ширина предпросмотра камеры в точках исходника
-EYE_SCALE_MAX = 3        # крупнее делать незачем: он не должен спорить с лицом
+# Ширина предпросмотра камеры на экране. Раньше кадр ужимался до 44 точек и
+# растягивался обратно — так было задумано под пиксельный портрет, а на
+# рисованном это просто мыло.
+EYE_MIN, EYE_MAX = 120, 240
 
 # Простой. Пока к ней не обращаются, портрет не стоит столбом: раз в полминуты
 # она меняет позу на несколько секунд и возвращается обратно. Позы берутся из
@@ -244,12 +246,16 @@ class Portrait(QWidget):
             self._eye = None
         self.cam_toggled.emit(on)
 
+    def _eye_w(self):
+        """Глазок занимает пятую часть панели, но не меньше и не больше рамок."""
+        return max(EYE_MIN, min(EYE_MAX, self.width() // 5))
+
     def set_camera_frame(self, jpeg):
-        """Кадр для предпросмотра. Мельчим, иначе видео забивает лицо."""
+        """Кадр для предпросмотра. Под размер подгоняем сразу, а не в отрисовке."""
         pix = QPixmap()
         if not pix.loadFromData(jpeg, "JPG") or pix.isNull():
             return
-        self._eye = pix.scaledToWidth(EYE_W, Qt.SmoothTransformation)
+        self._eye = pix.scaledToWidth(self._eye_w(), Qt.SmoothTransformation)
         self.update()
 
     def camera_failed(self):
@@ -319,15 +325,10 @@ class Portrait(QWidget):
             # Угол панели, а не угол кадра: кадр центрируется по ширине окна, и
             # привязанный к нему глазок переезжал на середину портрета, стоило
             # потянуть окно за край.
-            k = max(1, min(EYE_SCALE_MAX, self.width() // 300))
-            ew, eh = self._eye.width() * k, self._eye.height() * k
-            ex, ey = 14, self.height() - 14 - eh
-            if ex + ew + 6 > self.cam.x():     # узкое окно: кнопки подъехали
-                ey = self.cam.y() - eh - 10
-            p.fillRect(ex - 3, ey - 3, ew + 6, eh + 6, QColor(PANEL))
-            p.drawPixmap(ex, ey, ew, eh, self._eye)
-            p.setPen(accent)
-            p.drawRect(ex - 3, ey - 3, ew + 5, eh + 5)
+            ex, ey = 14, self.height() - 14 - self._eye.height()
+            if ex + self._eye.width() > self.cam.x():   # кнопки подъехали
+                ey = self.cam.y() - self._eye.height() - 10
+            p.drawPixmap(ex, ey, self._eye)
         p.end()
 
 

@@ -153,7 +153,7 @@ class Eyes(QObject):
     def _loop(self, cap):
         self.active.emit(True)
         self.status.emit("вижу")
-        preview_w = int(self.cfg.get("camera_preview_width", 160))
+        preview_w = int(self.cfg.get("camera_preview_width", 320))
         misses = 0
         while self._run:
             ok, frame = cap.read()
@@ -168,7 +168,7 @@ class Eyes(QObject):
             with self._lock:
                 self._last = frame
             if not self._idle:
-                small = self._encode(frame, preview_w, 60)
+                small = self._encode(frame, preview_w, 82)
                 if small:
                     self.frame.emit(small)
             time.sleep(1.0 / (IDLE_FPS if self._idle else FPS))
