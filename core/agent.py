@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 
 from PySide6.QtCore import QObject, Signal
@@ -64,21 +65,6 @@ SYSTEM_APPEND = (
     "У ТЕБЯ ЕСТЬ ПОИСК В ИНТЕРНЕТЕ (WebSearch) И ЧТЕНИЕ СТРАНИЦ (WebFetch): "
     "если спрашивают про новости, курсы, погоду, цены или что-то свежее — ищи, "
     "а не отвечай «не знаю» и не пересказывай память. Назови источник коротко. "
-    "ЧТО У ТЕБЯ ЕСТЬ НА ЭТОЙ МАШИНЕ, кроме обычных инструментов. "
-    "ОТКРЫТЬ ПАПКУ, ФАЙЛ ИЛИ САЙТ: "
-    "python C:/PixelClaude/tools/open_it.py <что открыть> — понимает путь, "
-    "адрес и название закладки. Напрямую через explorer.exe, start или "
-    "webbrowser открывать тебе не разрешено: подтвердить такую команду в "
-    "голосовой оболочке негде, окна с кнопкой «Разрешить» нет, и команда "
-    "просто повиснет. ЗАКЛАДКИ БРАУЗЕРА: "
-    "python C:/PixelClaude/tools/bookmarks.py <что ищем> — найдёт по имени, адресу "
-    "или папке; с ключом --open откроет найденное в браузере, им же открывается "
-    "и прямой адрес: --open vk.com. ОТЧЁТ ТОРГОВОГО БОТА: "
-    "python C:/PixelClaude/tools/crypto_report.py. Обе команды только читают. "
-    "ЧТО ТЕБЕ НЕЛЬЗЯ: за пределами рабочей папки ты файлы видишь и читаешь, "
-    "но не удаляешь, не перемещаешь и не правишь — закладки в том числе. Запрет "
-    "стоит в разрешениях, а не на словах, поэтому не обещай сделать то, чего "
-    "не можешь: честно скажи, что открыть покажу, а менять не дадут. "
     "ЕСЛИ ЗАДАЧА ТРЕБУЕТ РАБОТЫ инструментами: СНАЧАЛА скажи одну короткую фразу "
     "с тегом — «[think] Сейчас посмотрю» — и только потом берись за инструменты, "
     "иначе человек сидит в тишине и думает, что оболочка зависла. В конце — "
@@ -151,6 +137,112 @@ def _deny_path(path):
     return ("//" + drive.rstrip(":").lower() + rest.replace("\\", "/")).rstrip("/")
 
 
+# Команды оболочки, которые ей разрешено запускать. Имя файла → для чего.
+HELPERS = {
+    "crypto_report.py": "отчёт торгового бота",
+}
+
+# Свой MCP-сервер: открыть что-нибудь и найти закладку. Нужен не только ради
+# безопасности: путь там едет аргументом в JSON, а не строкой для оболочки.
+MCP_TOOLS = ("mcp__pixel__open", "mcp__pixel__bookmarks_find")
+
+# Открыть окно проводника. Разрешено под обоими именами и во всех трёх видах
+# записи правила: инструмент оболочки здесь зовётся то Bash, то PowerShell, а
+# шаблон аргументов отделяется то пробелом, то двоеточием — какая пара сойдётся,
+# заранее не скажешь, а лишнее правило ничего не стоит.
+WINDOW = ("explorer.exe", "explorer")
+
+# Этим запускают что угодно, не только окно, — закрыто.
+LAUNCHERS = ("start", "Start-Process", "Invoke-Item", "ii", "rundll32",
+             "wscript", "cscript", "mshta")
+
+def shell_rule(command):
+    """
+    Правило на команду оболочки — в двух видах, и оба неочевидны.
+
+    Инструмент оболочки на Windows называется PowerShell, а не Bash, и правило
+    Bash(...) к нему местами не прилипает. Шаблон аргументов отделяется
+    ПРОБЕЛОМ: `PowerShell(explorer.exe *)`. Форма с двоеточием, которую
+    подсказывает документация, здесь не срабатывает — и это не придирка к
+    синтаксису: двоеточие внутри команды (а в C:/… оно всегда) разбивает её
+    на «несколько операций», и совпадать становится нечему. Проверено
+    замерами: с двоеточием отказ приходит даже на правило, выписанное под
+    команду слово в слово, с пробелом — проходит.
+    """
+    return [f"PowerShell({command} *)", f"PowerShell({command}:*)",
+            f"PowerShell({command})",
+            f"Bash({command} *)", f"Bash({command}:*)", f"Bash({command})"]
+
+
+def tool_command(script, workdir):
+    """
+    Команда запуска утилиты — без двоеточия в пути.
+
+    Двоеточие в правиле разрешения claude означает границу между командой и
+    шаблоном аргументов. Поэтому правило с буквой диска — Bash(python
+    C:/PixelClaude/tools/open_it.py:*) — не совпадает ни с чем: проверено,
+    отказ приходит даже на правило, выписанное под команду слово в слово.
+    По той же причине запреты чтения пишутся как Read(//c/…), а не C:/… .
+
+    Путь от рабочей папки двоеточия не содержит, и правило наконец работает.
+    Если рабочая папка на другом диске, относительного пути не существует —
+    тогда остаётся абсолютный, и разрешение придётся подтверждать руками.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    full = os.path.join(root, "tools", script)
+    try:
+        rel = os.path.relpath(full, workdir)
+    except ValueError:
+        return "python " + full.replace("\\", "/")
+    return "python " + rel.replace("\\", "/")
+
+
+def mcp_config():
+    """
+    Описание своего сервера для --mcp-config.
+
+    pythonw вместо python намеренно: сервер поднимает сам claude, наши флаги
+    «без окна» на него не распространяются, и обычный интерпретатор мигнул бы
+    чёрным окном консоли на каждый запуск.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    quiet = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    runner = quiet if os.path.isfile(quiet) else sys.executable
+    return {"mcpServers": {"pixel": {
+        "command": runner,
+        "args": [os.path.join(root, "tools", "mcp_pixel.py")],
+    }}}
+
+
+def tool_rules(workdir):
+    """Разрешения на эти утилиты и подсказка про них одним куском."""
+    rules, lines = list(MCP_TOOLS), []
+    for name in WINDOW:
+        rules += shell_rule(name)
+    for script, what in HELPERS.items():
+        command = tool_command(script, workdir)
+        rules += shell_rule(command)
+        lines.append(f"Отчёт по крипте — командой {command}.")
+    hint = (
+        "\n\n[оболочка] ЧЕМ ОТКРЫВАТЬ ПАПКИ, ФАЙЛЫ И САЙТЫ. "
+        "Лучше всего — инструментом mcp__pixel__open: он понимает путь, "
+        "адрес, название закладки и имя браузера, и ему всё равно, как "
+        "записан путь. Закладки ищет mcp__pixel__bookmarks_find. "
+        "Если берёшь оболочку, то ТОЛЬКО explorer.exe и ТОЛЬКО в таком "
+        "виде: explorer.exe \"C:/Users/dakak/Downloads\" — имя с .exe, путь "
+        "целиком в кавычках, косые черты прямые. Без кавычек двоеточие в "
+        "C: рвёт команду на части, разрешение перестаёт совпадать, и она "
+        "повисает в ожидании клика, которого здесь некому сделать. "
+        "start, Start-Process, Invoke-Item, rundll32 и webbrowser закрыты "
+        "наглухо — не пробуй, это не обойти. Если пришло «requires "
+        "approval», значит команда записана не в том виде: перепиши по "
+        "образцу выше или возьми mcp__pixel__open, но не проси человека "
+        "что-то подтвердить — подтверждать здесь нечем и некому. "
+        + " ".join(lines)
+    )
+    return rules, hint
+
+
 def deny_rules(dirs):
     """
     Чем закрыта каждая открытая папка: секреты не читаем, файлы не трогаем.
@@ -173,9 +265,8 @@ def deny_rules(dirs):
         for tool in ("Write", "Edit", "NotebookEdit"):
             rules.append(f"{tool}({base})")
             rules.append(f"{tool}({base}/**)")
-    for verb in BASH_DESTRUCTIVE:
-        rules.append(f"Bash({verb})")
-        rules.append(f"Bash({verb}:*)")
+    for verb in tuple(BASH_DESTRUCTIVE) + LAUNCHERS:
+        rules += shell_rule(verb)
     return rules
 
 
@@ -366,7 +457,7 @@ class AgentRunner(QObject):
         cmd = [self.claude, "-p",
                "--input-format", "stream-json",
                "--output-format", "stream-json", "--verbose",
-               "--append-system-prompt", SYSTEM_APPEND]
+               "--append-system-prompt", SYSTEM_APPEND + tool_rules(self.workdir)[1]]
 
         # хуки — главный пожиратель времени, 3.7 с на ход (tools/bench_modes.py)
         mode = self.cfg.get("hooks_mode", "skip_user")
@@ -382,9 +473,13 @@ class AgentRunner(QObject):
             # текст по кускам: можно начать говорить с первой готовой фразы,
             # не дожидаясь, пока модель допишет остальное
             cmd += ["--include-partial-messages"]
-        if self.cfg.get("disable_mcp", True) and mode != "safe":
-            # первый ход с подключёнными MCP-серверами занимал 35 с вместо 12
-            cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        if mode != "safe":
+            # Чужие MCP-серверы не поднимаем: первый ход с ними занимал 35 с
+            # вместо 12. Свой — поднимаем всегда, через него она открывает
+            # папки и ищет закладки, командой оболочки это неразрешимо.
+            config = mcp_config() if self.cfg.get("pixel_tools", True) else {
+                "mcpServers": {}}
+            cmd += ["--strict-mcp-config", "--mcp-config", json.dumps(config)]
         # Разрешения приходили из пользовательских настроек, а мы их снимаем
         # ради хуков — значит, нужное разрешаем флагом. Поиск в вебе оболочке
         # нужен: спросить голосом «что там с курсом» и услышать «не могу» —
@@ -418,9 +513,10 @@ class AgentRunner(QObject):
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(root, ".pixel_settings.json")
+        rules, _ = tool_rules(self.workdir)
         data = {"permissions": {
             "deny": deny_rules(extra) + list(self.cfg.get("denied_tools") or []),
-            "allow": list(self.cfg.get("allowed_tools") or []),
+            "allow": rules + list(self.cfg.get("allowed_tools") or []),
         }}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
