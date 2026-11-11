@@ -304,10 +304,6 @@ class Portrait(QWidget):
         # индикаторы на светлом фоне зелёным не читаются, берём тёмные чернила
         light = self.canvas.lightness() > 128
         accent = QColor("#2b3550") if light else QColor(GREEN)
-        track = QColor("#8f9aa8") if light else QColor(EDGE_DARK)
-
-        p.setPen(track)
-        p.drawRect(int(x), int(y), w - 1, h - 1)
 
         if self.talking:                       # столбики «говорю»
             phase = int(self._clock.elapsed() / 140)
