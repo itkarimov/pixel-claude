@@ -41,6 +41,7 @@ import time
 from PySide6.QtCore import QObject, Signal
 
 from core.agent import find_claude, kill_tree
+from core import sessions
 
 SYSTEM = (
     "Ты — глаза голосовой помощницы. Тебе дают кадр с веб-камеры. "
@@ -49,6 +50,9 @@ SYSTEM = (
     "Если в кадре никого нет — так и скажи."
 )
 ASK = "Что видно сейчас? Одной фразой."
+
+# своя папка: отсюда описатель работает, сюда же claude кладёт его сессии
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class Describer(QObject):
@@ -67,6 +71,7 @@ class Describer(QObject):
         self._text = ""
         self._at = 0.0
         self._shots = 0              # кадров скормлено текущему процессу
+        self._sid = None             # сессия текущего процесса — её потом стирать
         self._lock = threading.Lock()
 
     # ── управление ────────────────────────────────────────────────────────
@@ -130,6 +135,26 @@ class Describer(QObject):
         # именно kill_tree, а не terminate: claude запускается через .cmd, и
         # обычная остановка снимает обёртку, оставляя claude.exe жить дальше
         kill_tree(proc)
+        self._forget_transcript()
+
+    def _forget_transcript(self):
+        """
+        Стереть разговор, который этот процесс оставил на диске.
+
+        Описатель по устройству одноразовый: процесс живёт до десятка кадров и
+        умирает, чтобы контекст не рос. Каждый оставлял после себя файл сессии,
+        в сайдбаре приложения невидимый и никому не нужный — за день их
+        набирался десяток. Стираем сразу и ровно свой: id берём из событий
+        этого процесса, гадать не о чем.
+        """
+        sid, self._sid = self._sid, None
+        if not sid:
+            return
+        path = os.path.join(sessions.project_dir(HERE), sid + ".jsonl")
+        try:
+            os.remove(path)
+        except OSError:
+            pass                       # не успел появиться или занят — не беда
 
     def _spawn(self):
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -142,7 +167,7 @@ class Describer(QObject):
                "--model", self.cfg.get("watch_model", "haiku")]
         try:
             self._proc = subprocess.Popen(
-                cmd, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                cmd, cwd=HERE,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
                 errors="replace", bufsize=1, creationflags=flags)
@@ -181,6 +206,8 @@ class Describer(QObject):
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if self._sid is None:
+                self._sid = event.get("session_id")
             if event.get("type") != "result":
                 continue
             if event.get("is_error"):

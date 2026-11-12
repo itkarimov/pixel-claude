@@ -154,25 +154,36 @@ def bench_tts():
 
 def bench_agent(models=("", "haiku")):
     line("ХОД МОДЕЛИ (claude CLI, долгоживущий процесс)")
-    import shutil
 
-    claude = shutil.which("claude") or shutil.which("claude.cmd")
-    if not claude:
+    from app import load_config
+    from core.agent import REMINDER, AgentRunner
+
+    cfg = load_config()
+    agent = AgentRunner(cfg)
+    if not agent.claude:
         print("claude не найден в PATH")
         return
-
-    from core.agent import SYSTEM_APPEND, REMINDER
+    print("команда собирается тем же core/agent.py, что и у оболочки:")
+    print("со своим MCP-сервером, файлом разрешений и открытыми папками.")
+    print("--resume снят намеренно: замеры в живой разговор не пишем.\n")
 
     for model in models:
-        cmd = [claude, "-p", "--input-format", "stream-json",
-               "--output-format", "stream-json", "--verbose",
-               "--append-system-prompt", SYSTEM_APPEND,
-               "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        # реальная команда оболочки, из неё убран только --resume
+        src, cmd, i = agent._build_cmd(), [], 0
+        while i < len(src):
+            if src[i] == "--resume":
+                i += 2
+                continue
+            if src[i] == "--model":
+                i += 2                      # модель ставим свою, ниже
+                continue
+            cmd.append(src[i])
+            i += 1
         if model:
             cmd += ["--model", model]
 
         t_spawn = time.perf_counter()
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=agent.workdir, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace",
                                 bufsize=1, creationflags=NOWINDOW)
@@ -219,7 +230,8 @@ def bench_agent(models=("", "haiku")):
                 proc.stdin.close()
             except OSError:
                 pass
-            proc.terminate()
+            from core.agent import kill_tree
+            kill_tree(proc)
 
 
 if __name__ == "__main__":

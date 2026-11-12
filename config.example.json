@@ -12,7 +12,6 @@
   "_чужие_папки": "extra_dirs — папки за пределами рабочей, куда разрешено смотреть (--add-dir). Открываются ТОЛЬКО НА ЧТЕНИЕ: удаление, перемещение и правка в них запрещаются автоматически, писать она может лишь в workdir. Секреты (.env, ключи, токены, .ssh, .claude, AppData) закрываются сами — списки в core/agent.py: SECRET_GLOBS и SECRET_DIRS. denied_tools — если надо закрыть что-то ещё; путь только абсолютный, в форме Read(//c/Папка/файл): относительные маски вида Read(**/*key*) НЕ работают, проверено tools/deny_test.py. Что всё это и правда закрыто — tools/readonly_test.py.",
   "extra_dirs": [],
   "denied_tools": [],
-  "disable_mcp": true,
   "_второй_мозг": "Кнопка МОЗГ внизу ленты переключает на Meta AI. Ключ можно не писать сюда, а задать переменной окружения LLAMA_API_KEY или META_API_KEY. Получить: https://ai.developer.meta.com. У Meta AI нет инструментов — ни файлов, ни команд, ни поиска. Старый api.llama.com закрыт 6 июля 2026 и на любой ключ отвечает 401 — не путать с плохим ключом.",
   "llama_api_key": "",
   "llama_model": "muse-spark-1.2",
@@ -79,5 +78,6 @@
   "window_width": 0,
   "window_height": 0,
   "portrait_share": 0.6,
-  "home_session": "Чат с пикселем"
+  "home_session": "Чат с пикселем",
+  "pixel_tools": true
 }
