@@ -203,6 +203,10 @@ class Shell(QObject):
         self.speaker.shutup()
         self.backend = name
         self.win.chat.set_brain(name)
+        # Лента принадлежит разговору, а не окну: у каждого мозга свой, и
+        # показывать в клодовской ленте хвост от Meta AI незачем. Поэтому
+        # чистим и подтягиваем историю того разговора, в который пришли.
+        self.win.chat.clear()
         if name == "claude":
             self.win.chat.append("system", "мозг: Claude")
             if not self.agent.alive():
@@ -217,6 +221,7 @@ class Shell(QObject):
                 self.win.chat.append("system", "и без интернета: поиск "
                                                "выключен в config.json")
         self.on_list(self._collect_sessions())      # у каждого мозга свой список
+        self._tail_current()
 
     # ── трей ──────────────────────────────────────────────────────────────
     def _tray(self):
@@ -411,6 +416,12 @@ class Shell(QObject):
         save_state({"session_id": item["id"], "cwd": item.get("cwd"),
                     "path": item.get("path"), "title": item.get("title"),
                     "brain": item.get("brain") or "claude"})
+
+    def _tail_current(self):
+        """Подтянуть последние реплики того разговора, что открыт сейчас."""
+        item = self._find(self.brain.session_id) if self.brain.session_id else None
+        if item:
+            self._load_tail(item)
 
     def _load_tail(self, item):
         """Хвост читаем в потоке: файл активной сессии бывает на мегабайты."""
