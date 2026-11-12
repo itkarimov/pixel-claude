@@ -33,3 +33,6 @@ assets/voices/
 
 # модели распознавания в ONNX, 110–609 МБ — tools/get_onnx_model.py
 models/
+
+# свои сессии-сироты, убранные из ~/.claude/projects — лежат неделю и удаляются
+sessions_trash/

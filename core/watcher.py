@@ -40,6 +40,8 @@ import time
 
 from PySide6.QtCore import QObject, Signal
 
+from core.agent import find_claude, kill_tree
+
 SYSTEM = (
     "Ты — глаза голосовой помощницы. Тебе дают кадр с веб-камеры. "
     "Ответь ОДНОЙ короткой фразой по-русски: кто в кадре, чем занят, что вокруг. "
@@ -59,7 +61,7 @@ class Describer(QObject):
         super().__init__(parent)
         self.cfg = cfg
         self.eyes = eyes
-        self.claude = shutil.which("claude") or shutil.which("claude.cmd")
+        self.claude = find_claude()
         self._proc = None
         self._run = False
         self._text = ""
@@ -125,12 +127,9 @@ class Describer(QObject):
         """Уронить процесс, чтобы накопленные кадры ушли вместе с его контекстом."""
         proc, self._proc = self._proc, None
         self._shots = 0
-        if proc and proc.poll() is None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            proc.terminate()
+        # именно kill_tree, а не terminate: claude запускается через .cmd, и
+        # обычная остановка снимает обёртку, оставляя claude.exe жить дальше
+        kill_tree(proc)
 
     def _spawn(self):
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0

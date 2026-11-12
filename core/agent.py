@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 from PySide6.QtCore import QObject, Signal
 
@@ -327,6 +328,112 @@ def split_emotion(text):
     return None, (text or "").strip()
 
 
+def kill_tree(proc):
+    """
+    Прибить процесс вместе с потомками.
+
+    На Windows claude запускается через claude.cmd: Popen держит обёртку
+    cmd.exe, а настоящий claude.exe и его node — уже внуки. terminate()
+    снимает только обёртку, внуки остаются жить и висят в памяти до
+    перезагрузки. Так в диспетчере задач и набрался двадцать один claude по
+    60–150 МБ: каждая смена сессии оставляла по копии. taskkill /T убирает
+    дерево целиком.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.stdin.close()
+    except (OSError, ValueError, AttributeError):
+        pass
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            return
+        except OSError:
+            pass
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+
+
+STRAY_MARK = "помощниц"      # кусок нашей системной приписки, у чата и описателя
+
+
+def find_claude():
+    """
+    Путь к claude — именно к .exe, а не к .cmd. Разница тут решает всё.
+
+    npm кладёт в PATH обёртку claude.cmd, и та зовёт настоящий exe строкой
+    `"%dp0%\\…\\claude.exe"   %*`. Popen на .cmd поднимает cmd.exe, тот
+    раскрывает %*, и ПЕРЕВОД СТРОКИ внутри аргумента обрывает команду ровно на
+    этом месте: остаток строки для cmd — отдельная команда, и она молча
+    пропадает.
+
+    Системная приписка у нас многострочная. Значит, всё, что идёт после неё, —
+    --setting-sources, --mcp-config, --add-dir, --settings, --permission-mode,
+    --model и --resume — до claude не доезжало вообще. Снаружи это выглядело
+    как три разные поломки: разрешения не срабатывают (файла настроек не
+    было), свои инструменты не видны (MCP-сервер не поднимался) и после
+    каждого запуска появляется новая сессия (--resume терялся). Замеры по
+    синтаксису правил, которыми мы объясняли первое, меряли пустоту.
+
+    Прямой запуск exe обходит cmd.exe целиком: аргументы уходят процессу как
+    есть, с переводами строк внутри.
+    """
+    direct = shutil.which("claude.exe")
+    if direct:
+        return direct
+    wrapper = shutil.which("claude") or shutil.which("claude.cmd")
+    if not wrapper:
+        return None
+    # у обёртки рядом лежит node_modules с настоящим exe — её же путь и подскажет
+    exe = os.path.join(os.path.dirname(wrapper), "node_modules",
+                       "@anthropic-ai", "claude-code", "bin", "claude.exe")
+    return exe if os.path.isfile(exe) else wrapper
+
+
+def kill_strays():
+    """
+    Снять claude-процессы, оставшиеся от прошлого запуска. Возвращает сколько.
+
+    Зовётся один раз при старте, до того как поднимется свой. Своих узнаём по
+    куску системной приписки в командной строке: у процессов приложения Claude
+    её нет вовсе, проверено — из сорока живых под неё попали ровно наши.
+
+    Через PowerShell, потому что командная строка чужого процесса из питона без
+    psutil никак не достаётся. Команда уходит в -EncodedCommand (UTF-16), иначе
+    русская буква в ней по дороге превращается в вопросительные знаки.
+    """
+    if os.name != "nt":
+        return 0
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*" + STRAY_MARK + "*' } | "
+              "ForEach-Object { $_.ProcessId }")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16-le")).decode()],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    killed = 0
+    for line in (out.stdout or "").split():
+        if not line.strip().isdigit():
+            continue
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", line.strip()],
+                           capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            killed += 1
+        except OSError:
+            pass
+    return killed
+
+
 class AgentRunner(QObject):
     """Долгоживущий процесс claude и разбор его потока событий."""
 
@@ -342,8 +449,9 @@ class AgentRunner(QObject):
         self.cfg = cfg
         self.session_id = None
         self.workdir = cfg.get("workdir") or None
-        self.claude = shutil.which("claude") or shutil.which("claude.cmd")
+        self.claude = find_claude()
         self._proc = None
+        self._starting = False   # процесс уже поднимается — второй не нужен
         self._lock = threading.Lock()
         self._buf = ""           # текст сообщения, копится по кускам
         self._said = ""          # что уже озвучено из текущего сообщения
@@ -359,9 +467,20 @@ class AgentRunner(QObject):
     def alive(self):
         return self._proc is not None and self._proc.poll() is None
 
+    def _claim(self):
+        """Право поднять процесс. Второму потоку оно не достанется."""
+        with self._lock:
+            if self._starting or (self._proc is not None
+                                  and self._proc.poll() is None):
+                return False
+            self._starting = True
+            return True
+
     def start(self):
         """Поднять процесс заранее, чтобы первая реплика не ждала инициализации."""
-        if not self.claude or self.alive():
+        if not self.claude or not self.session_id:
+            return
+        if not self._claim():
             return
         threading.Thread(target=self._spawn, daemon=True).start()
 
@@ -377,6 +496,10 @@ class AgentRunner(QObject):
         if not self.claude:
             self.log.emit("error", "claude CLI не найден в PATH")
             return
+        if not self.session_id:
+            self.log.emit("user", (display or text).strip())
+            self.log.emit("error", "сессия не выбрана — выбери её в списке сверху")
+            return
         self.log.emit("user", (display or text).strip())
         if self._busy:
             # текст озвучивается раньше, чем ход официально закрыт: человек уже
@@ -389,7 +512,14 @@ class AgentRunner(QObject):
     def _write(self, text, image=None):
         if not self.alive():                      # процесс умер или ещё не поднят
             self.log.emit("system", "поднимаю claude…")
-            self._spawn(wait=True)
+            if self._claim():
+                self._spawn(wait=True)
+            else:
+                # поднимают в другом потоке — ждём его, а не заводим второй
+                for _ in range(100):
+                    time.sleep(0.05)
+                    if self.alive():
+                        break
             if not self.alive():
                 return
 
@@ -431,10 +561,15 @@ class AgentRunner(QObject):
         self.restart()
 
     def reset(self):
-        self.session_id = None
-        self.workdir = self.cfg.get("workdir") or None
-        self.restart()
-        self.log.emit("system", "новая сессия — контекст пустой")
+        """
+        Новых сессий оболочка не заводит.
+
+        Созданная отсюда сессия в сайдбаре приложения не появляется: сайдбар —
+        отдельный реестр, пишет в него только само приложение. Снаружи
+        получался разговор, которого в списке нет и открыть его нечем.
+        Поэтому работаем только в том, что в сайдбаре уже есть.
+        """
+        self.log.emit("error", "новую сессию не создаю — выбери из списка")
 
     def restart(self):
         self.stop()
@@ -443,12 +578,7 @@ class AgentRunner(QObject):
     def stop(self):
         with self._lock:
             proc, self._proc = self._proc, None
-        if proc and proc.poll() is None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            proc.terminate()
+        kill_tree(proc)
         self._set_busy(False)
         self.ready.emit(False)
 
@@ -523,6 +653,20 @@ class AgentRunner(QObject):
         return path
 
     def _spawn(self, wait=False):
+        """
+        Поднять процесс. Право на это берётся через _claim() — иначе два
+        потока заведут две копии claude, и обе будут жить.
+
+        Без выбранной сессии не запускаемся вовсе: claude без --resume заводит
+        новую сессию, в сайдбаре приложения её не видно, и после неё остаётся
+        мусорный транскрипт. Оболочка работает только в том разговоре, который
+        выбран в списке.
+        """
+        if not self.session_id:
+            with self._lock:
+                self._starting = False
+            self.log.emit("error", "сессия не выбрана — claude не запускаю")
+            return
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             proc = subprocess.Popen(
@@ -531,10 +675,13 @@ class AgentRunner(QObject):
                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
                 errors="replace", bufsize=1, creationflags=flags)
         except Exception as exc:
+            with self._lock:
+                self._starting = False
             self.log.emit("error", f"не смогла запустить claude: {exc}")
             return
         with self._lock:
             self._proc = proc
+            self._starting = False
         self.ready.emit(True)
         target = self._read
         if wait:

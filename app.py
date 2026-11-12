@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (QApplication, QMenu,     # noqa: E402
                                QSystemTrayIcon)
 
 from core import sessions                               # noqa: E402
-from core.agent import AgentRunner                      # noqa: E402
+from core.agent import AgentRunner, kill_strays         # noqa: E402
 from core.confirm import Confirmer                      # noqa: E402
 from core import groq                                   # noqa: E402
 from core import llama                                  # noqa: E402
@@ -168,6 +168,7 @@ class Shell(QObject):
         self.saved_frames = 0        # сколько кадров не отправили как повтор
         self.tray = None
         self.items = []              # сессии из сайдбара приложения
+        self.asked_sid = None        # сессия, которую мы просили открыть
         self.last_prompt = ""        # им озаглавим сессию, если её заведут сейчас
 
         self._wire()
@@ -325,25 +326,50 @@ class Shell(QObject):
             chat.append("error", "claude CLI не найден — проверь PATH")
             return
 
-        # Прошлую сессию поднимаем из state.json мгновенно, а список — в фоне:
-        # сбор занимает секунды, и окно на это время просто висело бы.
-        state = load_state()
+        # Всегда открываемся в домашней сессии — той, что названа в конфиге
+        # (home_session). Прошлая сессия из state.json больше не поднимается:
+        # уехать в чужой разговор можно было одним касанием списка, а заметить
+        # это — только по чужому хвосту в ленте.
         self.items = []
-        if state.get("session_id"):
-            # мозг запоминаем вместе с сессией: id от Meta AI для claude
-            # бессмыслен, --resume на него не встанет
-            self.backend = state.get("brain") or "claude"
-            self.win.chat.set_brain(self.backend)
-            self.brain.set_session(state["session_id"], state.get("cwd"))
-            chat.append("system", f"продолжаю: {state.get('title') or 'прошлая сессия'}")
-            if state.get("path"):
-                self._load_tail({"id": state["session_id"], "path": state["path"],
-                                 "brain": self.backend})
+        self.backend = "claude"
+        self.win.chat.set_brain(self.backend)
+        home = self._home()
+        if home:
+            self.brain.set_session(home["id"], home.get("cwd"))
+            self.win.chat.set_sessions(self.items, home["id"], allow_new=False)
+            chat.append("system", f"сессия: {home['title']}")
+            self._remember(home)
+            self._load_tail(home)
         else:
-            chat.append("system", "включи микрофон и говори")
+            want = self.cfg.get("home_session") or "Чат с пикселем"
+            chat.append("error", f"сессии «{want}» нет в сайдбаре приложения — "
+                                 f"выбери другую в списке сверху")
+        self._sweep()
 
-        chat.set_status("собираю список сессий…")
-        self._reload_sessions()
+    def _home(self):
+        """
+        Домашняя сессия: ищем по названию в сайдбаре приложения.
+
+        По названию, а не по id: сессию можно удалить и завести заново, и id
+        тогда станет другим, а название человек держит прежним. Если таких
+        несколько — берём свежую, список и так отсортирован по времени.
+        """
+        want = (self.cfg.get("home_session") or "Чат с пикселем").strip().lower()
+        self.items = self._collect_sessions()
+        self.win.chat.set_sessions(self.items, None, allow_new=False)
+        for it in self.items:
+            if (it.get("title") or "").strip().lower() == want:
+                return it
+        return None
+
+    def _sweep(self):
+        """Убрать свои сессии-сироты: их нет в сайдбаре, открыть их нечем."""
+        def work():
+            keep = [self.brain.session_id] if self.brain.session_id else []
+            moved = sessions.sweep(keep)
+            if moved:
+                self.list_loaded.emit(self._collect_sessions())
+        threading.Thread(target=work, daemon=True).start()
 
     def _note_prompt(self, kind, text):
         if kind == "user":
@@ -373,13 +399,15 @@ class Shell(QObject):
 
     def on_list(self, items):
         self.items = items
-        self.win.chat.set_sessions(self.items, self.brain.session_id)
+        self.win.chat.set_sessions(self.items, self.brain.session_id,
+                                   allow_new=self.backend != "claude")
         self.win.chat.set_status("готова")
 
     def _find(self, session_id):
         return next((it for it in self.items if it["id"] == session_id), None)
 
     def _remember(self, item):
+        self.asked_sid = item["id"]
         save_state({"session_id": item["id"], "cwd": item.get("cwd"),
                     "path": item.get("path"), "title": item.get("title"),
                     "brain": item.get("brain") or "claude"})
@@ -419,29 +447,33 @@ class Shell(QObject):
         self._load_tail(item)
 
     def on_session_new(self):
+        """Новый разговор — только у Meta AI и Groq: у них список свой."""
+        if self.backend == "claude":
+            self.win.chat.append("error", "новую сессию не создаю — выбери из списка")
+            return
         self.speaker.shutup()
         self.eyes.forget()
         self.watcher.forget()
         self.brain.reset()
-        self.brain.workdir = self.cfg["workdir"]     # новая — в папке из конфига
         self.win.chat.clear()
-        self.win.chat.append("system", "новая сессия — говори")
+        self.win.chat.append("system", "новый разговор — говори")
         self.win.portrait.set_emotion("neutral")
         save_state({})
-        self.win.chat.set_sessions(self.items, None)
+        self.win.chat.set_sessions(self.items, None, allow_new=True)
 
     def on_session_created(self, session_id):
         """
-        claude завёл новую сессию. В списке её не будет: список — это сайдбар
-        приложения, а туда сессия снаружи не попадает. Показываем её отдельной
-        строкой «текущая» и запоминаем в state.json, чтобы поднять при запуске.
+        claude сообщил свой id сессии.
+
+        Обычно это та, что мы и открыли через --resume. Если он всё же завёл
+        свою — в сайдбаре её не будет, и мы её только показываем, а домашней
+        не делаем: при следующем запуске оболочка снова откроет ту, что в
+        конфиге, а этот огрызок уберёт уборщик.
         """
-        item = {"id": session_id, "cwd": self.agent.workdir,
-                "path": os.path.join(sessions.project_dir(self.agent.workdir),
-                                     f"{session_id}.jsonl"),
-                "title": (self.last_prompt or "новый разговор")[:60]}
-        save_state({**item, "session_id": session_id})
-        self.win.chat.set_sessions(self.items, session_id)
+        if session_id == self.asked_sid:
+            return
+        self.win.chat.set_sessions(self.items, session_id,
+                                   allow_new=self.backend != "claude")
 
     def on_api_session(self, session_id, name):
         """Meta AI или Groq завели разговор — запоминаем, чтобы поднять при запуске."""
@@ -610,6 +642,10 @@ class Shell(QObject):
 
 def main():
     install_crash_log()
+    # Прошлый запуск мог оставить claude живым: до kill_tree обычная остановка
+    # снимала только обёртку .cmd, а сам процесс оставался в памяти. Снимаем
+    # такие хвосты до того, как поднимем свой.
+    strays = kill_strays()
     cfg = load_config()
     app = QApplication(sys.argv)
     app.setApplicationName("Pixel Claude")
@@ -619,6 +655,8 @@ def main():
         app.setWindowIcon(QIcon(icon))
 
     shell = Shell(cfg)
+    if strays:
+        shell.win.chat.append("system", f"снято зависших claude: {strays}")
     shell.show()
     sys.exit(app.exec())
 

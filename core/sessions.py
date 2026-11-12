@@ -32,6 +32,7 @@ import glob
 import json
 import os
 import re
+import time
 from collections import deque
 from datetime import datetime
 
@@ -277,3 +278,104 @@ def tail(path, limit=10):
 
 def when(mtime):
     return datetime.fromtimestamp(mtime).strftime("%d.%m %H:%M")
+
+
+# ── уборка за собой ───────────────────────────────────────────────────────────
+#
+# Сессии, заведённые не приложением, в сайдбаре не появляются: сайдбар — это
+# отдельный реестр, и пишет в него только приложение. Такой разговор открыть
+# потом нечем, а место он занимает: за один день набралось полтора десятка
+# файлов на мегабайт с лишним.
+#
+# Основной чат их больше не плодит — без выбранной сессии claude не
+# запускается вовсе. Но описатель камеры по устройству обязан быть отдельным
+# коротким процессом, и за ним транскрипты остаются. Их и подчищаем.
+#
+# Трогаем только своё, и узнаём его по ПЕРВОЙ реплике: у чата это приписка
+# оболочки, у описателя — его единственный вопрос. Сессия, заведённая руками
+# из терминала, такой реплики не имеет и остаётся на месте. Чужое не трогаем,
+# даже если его нет в сайдбаре.
+
+PIXEL_MARK = "[оболочка]"
+WATCH_ASK = "Что видно сейчас? Одной фразой."
+
+
+def trash_root():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "sessions_trash")
+
+
+def _first_user(path, limit=120):
+    """Первая реплика человека в транскрипте. Читаем только начало файла."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for _ in range(limit):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") != "user":
+                    continue
+                text = _text(ev.get("message"))
+                if text.strip():
+                    return text
+    except OSError:
+        pass
+    return ""
+
+
+def is_ours(path):
+    """Наш ли это транскрипт — чата оболочки или описателя камеры."""
+    first = _first_user(path)
+    return bool(first) and (PIXEL_MARK in first or first.strip() == WATCH_ASK)
+
+
+def orphans(keep=()):
+    """Наши транскрипты, которых нет в сайдбаре. keep — то, что сейчас открыто."""
+    rows, _ = _registry()
+    if rows is None:
+        return []                      # без реестра сравнивать не с чем
+    known = {r["cliSessionId"] for r in rows if r.get("cliSessionId")}
+    known.update(keep)
+    out = []
+    for path in glob.glob(os.path.join(projects_root(), "*", "*.jsonl")):
+        if any(d in path for d in SKIP_DIRS):
+            continue
+        if os.path.splitext(os.path.basename(path))[0] in known:
+            continue
+        if is_ours(path):
+            out.append(path)
+    return out
+
+
+def sweep(keep=(), days=7):
+    """
+    Убрать наши сессии-сироты в sessions_trash, а старое из корзины — удалить.
+
+    Через корзину, а не сразу насовсем: правило «что не в сайдбаре — наше»
+    держится на разборе первой реплики, и ошибиться в нём можно. Неделя даёт
+    время заметить пропажу.
+    """
+    moved = 0
+    for path in orphans(keep):
+        folder = os.path.join(trash_root(), os.path.basename(os.path.dirname(path)))
+        try:
+            os.makedirs(folder, exist_ok=True)
+            target = os.path.join(folder, os.path.basename(path))
+            if os.path.exists(target):
+                os.remove(target)
+            os.replace(path, target)
+            moved += 1
+        except OSError:
+            continue
+    edge = time.time() - days * 86400
+    for old in glob.glob(os.path.join(trash_root(), "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(old) < edge:
+                os.remove(old)
+        except OSError:
+            continue
+    return moved

@@ -394,8 +394,8 @@ class ConfirmBar(QWidget):
         lay.addWidget(self.no, 0)
         self.setStyleSheet(f"background:{PANEL}; border:3px solid {AMBER};")
 
-    def ask(self, text):
-        self.text.setText(f"выполнять? {text}")
+    def ask(self, text, verb="выполнять?"):
+        self.text.setText(f"{verb} {text}")
         self.show()
 
 
@@ -458,6 +458,17 @@ class Chat(QWidget):
             QPushButton:hover {{ background:#292244; }}
         """)
         self.btn_new.clicked.connect(self.session_new.emit)
+
+        # Смена сессии — через подтверждение: список открывается одним
+        # касанием, а уехать из своего разговора в чужой посреди работы
+        # неприятно. До «да» выпадашка остаётся на текущей строке.
+        self.switch = ConfirmBar()
+        self.switch.hide()
+        self.switch.confirmed.connect(self._switch_yes)
+        self.switch.rejected.connect(self._switch_no)
+        self._pending_sid = None
+        self._current = None
+        self._allow_new = True
 
         self.view = Feed(readOnly=True)
         self.view.setStyleSheet(
@@ -527,24 +538,58 @@ class Chat(QWidget):
         lay.addLayout(top)
         lay.addWidget(self.view, 1)
         lay.addLayout(bottom)
+        lay.addWidget(self.switch, 0)
         lay.addWidget(self.confirm, 0)
         lay.addWidget(self.input, 0)
 
     # ── список сессий ─────────────────────────────────────────────────────
-    def set_sessions(self, items, current_id=None):
-        """items — из core.sessions.list_sessions(). Первый пункт всегда новая."""
+    def set_sessions(self, items, current_id=None, allow_new=True):
+        """
+        items — из core.sessions.list_sessions().
+
+        allow_new=False у Клода: его сессии живут в сайдбаре приложения, а
+        заведённая отсюда туда не попадает, и открыть её потом нечем. Поэтому
+        выбираем только из готовых. У Meta AI и Groq список свой, собственный,
+        и новый разговор там заводить можно.
+        """
+        self._current = current_id
+        self._allow_new = allow_new
+        self.btn_new.setVisible(allow_new)
         self.picker.blockSignals(True)
         self.picker.clear()
-        self.picker.addItem("(новая сессия)", None)
+        if allow_new:
+            self.picker.addItem("(новая сессия)", None)
         for it in items:
             self.picker.addItem(it["label"], it["id"])
-        idx = self.picker.findData(current_id) if current_id else 0
+        idx = self.picker.findData(current_id) if current_id else -1
         if current_id and idx < 0:
             # файл сессии ещё не появился на диске — показываем её отдельной строкой
-            self.picker.insertItem(1, "· текущая сессия", current_id)
-            idx = 1
-        self.picker.setCurrentIndex(idx if idx >= 0 else 0)
+            at = 1 if allow_new else 0
+            self.picker.insertItem(at, "· текущая сессия", current_id)
+            idx = at
+        if idx < 0 and not allow_new:
+            self.picker.insertItem(0, "(сессия не выбрана)", None)
+            idx = 0
+        self.picker.setCurrentIndex(max(idx, 0))
         self.picker.blockSignals(False)
+
+    def _restore(self):
+        """Вернуть выпадашку на текущую сессию — выбор ещё не подтверждён."""
+        self.picker.blockSignals(True)
+        idx = self.picker.findData(self._current) if self._current else 0
+        self.picker.setCurrentIndex(max(idx, 0))
+        self.picker.blockSignals(False)
+
+    def _switch_yes(self):
+        self.switch.hide()
+        sid, self._pending_sid = self._pending_sid, None
+        if sid:
+            self.session_picked.emit(sid)
+
+    def _switch_no(self):
+        self.switch.hide()
+        self._pending_sid = None
+        self._restore()
 
     # ── переключатель мозга ───────────────────────────────────────────────
     def _style_brain(self, name):
@@ -574,10 +619,18 @@ class Chat(QWidget):
 
     def _picked(self, index):
         sid = self.picker.itemData(index)
-        if sid:
-            self.session_picked.emit(sid)
-        else:
-            self.session_new.emit()
+        if not sid:
+            if self._allow_new:
+                self.session_new.emit()
+            else:
+                self._restore()
+            return
+        if sid == self._current:
+            return
+        self._pending_sid = sid
+        label = self.picker.itemText(index)
+        self._restore()
+        self.switch.ask(label, verb="перейти в сессию")
 
     def _submit(self):
         text = self.input.text().strip()
