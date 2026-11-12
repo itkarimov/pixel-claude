@@ -253,6 +253,21 @@ class Listener(QObject):
             self._q.put(indata[:, 0].copy())
 
     def _worker(self):
+        """
+        Обёртка над циклом захвата.
+
+        Поток живёт дольше окна: пока он доходит до конца итерации, Qt успевает
+        снести объект, и следующий же emit падает с «Signal source has been
+        deleted». Для нас это обычный выход, а в crash.log от него оставался
+        след на каждом закрытии.
+        """
+        try:
+            self._listen()
+        except RuntimeError as exc:
+            if "deleted" not in str(exc):
+                raise
+
+    def _listen(self):
         import sounddevice as sd
 
         if self._engine is None:
